@@ -40,10 +40,6 @@ class Pipe:
             default=4096,
             description="Default maximum number of tokens to generate in the response.",
         )
-        ENABLE_CODE_EXECUTION: bool = Field(
-            default=True,
-            description="Enable Claude's code execution capability for supported models.",
-        )
         ENABLE_THINKING: bool = Field(
             default=True,
             description="Enable Claude's extended thinking capability for supported models.",
@@ -53,7 +49,6 @@ class Pipe:
         ANTHROPIC_API_KEY: str = Field(default="")
         THINKING_BUDGET: int = Field(default=16000)
         MAX_TOKENS: int = Field(default=4096)
-        ENABLE_CODE_EXECUTION: bool = Field(default=True)
         ENABLE_THINKING: bool = Field(default=True)
 
     def __init__(self):
@@ -235,15 +230,15 @@ class Pipe:
         # Reset client to ensure correct headers for the model
         self.client = None
 
-        # Check if code execution is enabled in valves
-        code_execution_enabled = (
-            user_valves.ENABLE_CODE_EXECUTION
-            if user_valves and hasattr(user_valves, "ENABLE_CODE_EXECUTION")
-            else self.valves.ENABLE_CODE_EXECUTION
-        )
+        features = body.get("features")
+        # Check if code execution is enabled in the UI
+        code_execution_enabled = False
+        if features and isinstance(features, dict):
+            code_execution_enabled = features.get("code_interpreter", False)
+            # Disable OWUI code execution
+            features["code_interpreter"] = False
 
         # Check if web search is enabled in the UI
-        features = body.get("features")
         web_search_enabled = False
         if features and isinstance(features, dict):
             web_search_enabled = features.get("web_search", False)

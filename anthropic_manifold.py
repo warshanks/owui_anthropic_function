@@ -249,6 +249,8 @@ class Pipe:
             if isinstance(features, dict)
             else False
         )
+        # Disable OWUI web search
+        features["web_search"] = False
 
         # Check if thinking is enabled in valves
         thinking_enabled = (

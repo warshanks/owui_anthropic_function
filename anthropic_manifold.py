@@ -287,7 +287,8 @@ class Pipe:
             if isinstance(message.get("content"), list):
                 for item in message["content"]:
                     if item["type"] == "text":
-                        processed_content.append({"type": "text", "text": item["text"]})
+                        if item["text"]:  # Only add non-empty text blocks
+                            processed_content.append({"type": "text", "text": item["text"]})
                     elif item["type"] == "image_url":
                         processed_image = self.process_image(item)
                         processed_content.append(processed_image)

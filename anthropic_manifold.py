@@ -4,7 +4,6 @@ authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
 version: 0.7.0
-required_open_webui_version: 0.3.17
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -17,6 +16,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 """
 
 import os
+import re
 import time
 import requests
 from typing import List, Union, Generator, Iterator, Optional
@@ -44,10 +44,6 @@ class Pipe:
             default=True,
             description="Enable Claude's code execution capability for supported models.",
         )
-        ENABLE_WEB_SEARCH: bool = Field(
-            default=True,
-            description="Enable Claude's web search capability for supported models.",
-        )
         ENABLE_THINKING: bool = Field(
             default=True,
             description="Enable Claude's extended thinking capability for supported models.",
@@ -58,7 +54,6 @@ class Pipe:
         THINKING_BUDGET: int = Field(default=16000)
         MAX_TOKENS: int = Field(default=4096)
         ENABLE_CODE_EXECUTION: bool = Field(default=True)
-        ENABLE_WEB_SEARCH: bool = Field(default=True)
         ENABLE_THINKING: bool = Field(default=True)
 
     def __init__(self):
@@ -247,11 +242,12 @@ class Pipe:
             else self.valves.ENABLE_CODE_EXECUTION
         )
 
-        # Check if web search is enabled in valves
+        # Check if web search is enabled in the UI
+        features = body.get("features")
         web_search_enabled = (
-            user_valves.ENABLE_WEB_SEARCH
-            if user_valves and hasattr(user_valves, "ENABLE_WEB_SEARCH")
-            else self.valves.ENABLE_WEB_SEARCH
+            features.get("web_search", False)
+            if isinstance(features, dict)
+            else False
         )
 
         # Check if thinking is enabled in valves
@@ -307,9 +303,49 @@ class Pipe:
                                     "Total size of images exceeds 100 MB limit"
                                 )
             else:
-                processed_content = [
-                    {"type": "text", "text": message.get("content", "")}
-                ]
+                content_text = message.get("content", "")
+
+                # Check for thinking blocks with signatures in the text
+                # Format: <think>\n...\n<!-- signature: ... -->\n</think>
+                thinking_match = re.search(
+                    r"<think>(.*?)(?:<!-- signature: (.*?) -->)?\s*</think>",
+                    content_text,
+                    re.DOTALL
+                )
+
+                if thinking_match and message["role"] == "assistant":
+                    thinking_content = thinking_match.group(1).strip()
+                    signature = thinking_match.group(2)
+
+                    # Remove the thinking block from the text content
+                    text_content = re.sub(
+                        r"<think>.*?</think>\s*",
+                        "",
+                        content_text,
+                        flags=re.DOTALL
+                    ).strip()
+
+                    # Create the thinking block
+                    thinking_block = {
+                        "type": "thinking",
+                        "thinking": thinking_content
+                    }
+
+                    if signature:
+                        thinking_block["signature"] = signature
+
+                    processed_content.append(thinking_block)
+
+                    # Add remaining text if any
+                    if text_content:
+                        processed_content.append({
+                            "type": "text",
+                            "text": text_content
+                        })
+                else:
+                    processed_content = [
+                        {"type": "text", "text": content_text}
+                    ]
 
             processed_messages.append(
                 {"role": message["role"], "content": processed_content}
@@ -375,34 +411,21 @@ class Pipe:
                     thinking_budget = 0
 
                 if thinking_budget > 0:
-                    # Check if there are existing assistant messages in the conversation
-                    # When thinking is enabled, ALL assistant messages must start with thinking blocks
-                    # So we disable thinking if there are existing assistant messages to avoid API errors
-                    has_existing_assistant_messages = any(
-                        msg["role"] == "assistant" for msg in processed_messages
+                    # Set the thinking budget with the required type field
+                    params["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking_budget,
+                    }
+                    print(
+                        f"Enabling extended thinking with budget: {thinking_budget} tokens, max_tokens: {max_tokens}"
                     )
 
-                    if has_existing_assistant_messages:
+                    # Check if streaming is required for large max_tokens (>21,333 per documentation)
+                    if max_tokens > 21333 and not body.get("stream", False):
                         print(
-                            "Disabling thinking mode due to existing assistant messages in conversation history. "
-                            "Thinking mode is only available for new conversations."
+                            f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
                         )
-                    else:
-                        # Set the thinking budget with the required type field
-                        params["thinking"] = {
-                            "type": "enabled",
-                            "budget_tokens": thinking_budget,
-                        }
-                        print(
-                            f"Enabling extended thinking with budget: {thinking_budget} tokens, max_tokens: {max_tokens}"
-                        )
-
-                        # Check if streaming is required for large max_tokens (>21,333 per documentation)
-                        if max_tokens > 21333 and not body.get("stream", False):
-                            print(
-                                f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
-                            )
-                            body["stream"] = True
+                        body["stream"] = True
 
         # Add optional parameters
         if system_message:
@@ -442,6 +465,7 @@ class Pipe:
                 # For extended thinking: handle thinking blocks in the stream
                 self.is_thinking = False
                 self.thinking_start_time = None
+                self.thinking_signature = None
                 # Track code execution state
                 self.is_code_execution = False
                 self.code_execution_block_index = None
@@ -462,6 +486,7 @@ class Pipe:
                         ):
                             self.is_thinking = True
                             self.thinking_start_time = time.time()
+                            self.thinking_signature = None
                             # Yield opening tag for thinking block
                             yield "<think>\n"
 
@@ -486,6 +511,13 @@ class Pipe:
                             ):
                                 # Yield thinking content as it arrives
                                 yield event.delta.thinking
+                            elif event.delta.type == "signature_delta" and hasattr(
+                                event.delta, "signature"
+                            ):
+                                # Capture signature
+                                if self.thinking_signature is None:
+                                    self.thinking_signature = ""
+                                self.thinking_signature += event.delta.signature
 
                         # Handle thinking content block end
                         elif self.is_thinking and event.type == "content_block_stop":
@@ -494,6 +526,11 @@ class Pipe:
                             if self.thinking_start_time:
                                 thinking_time = time.time() - self.thinking_start_time
                                 self.thinking_start_time = None
+
+                            # Inject signature if present
+                            if self.thinking_signature:
+                                yield f"\n<!-- signature: {self.thinking_signature} -->"
+                                self.thinking_signature = None
 
                             # Close the thinking block
                             yield "\n</think>\n\n"
@@ -650,8 +687,12 @@ class Pipe:
                             hasattr(content_block, "thinking")
                             and content_block.thinking
                         ):
+                            signature_part = ""
+                            if hasattr(content_block, "signature") and content_block.signature:
+                                signature_part = f"\n<!-- signature: {content_block.signature} -->"
+
                             result_parts.append(
-                                f"<think>\n{content_block.thinking}\n</think>\n\n"
+                                f"<think>\n{content_block.thinking}{signature_part}\n</think>\n\n"
                             )
 
                     # Handle redacted thinking content blocks

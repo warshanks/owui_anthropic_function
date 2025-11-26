@@ -244,13 +244,11 @@ class Pipe:
 
         # Check if web search is enabled in the UI
         features = body.get("features")
-        web_search_enabled = (
-            features.get("web_search", False)
-            if isinstance(features, dict)
-            else False
-        )
-        # Disable OWUI web search
-        features["web_search"] = False
+        web_search_enabled = False
+        if features and isinstance(features, dict):
+            web_search_enabled = features.get("web_search", False)
+            # Disable OWUI web search
+            features["web_search"] = False
 
         # Check if thinking is enabled in valves
         thinking_enabled = (

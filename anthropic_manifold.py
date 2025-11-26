@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.7.0
+version: 0.8.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:

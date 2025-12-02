@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.9.0-blue)
+![Version](https://img.shields.io/badge/version-0.10.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -8,6 +8,7 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 ## Features
 
 - **Web Search**: Enable Claude to search the web for real-time information.
+- **Web Fetch**: Fetch and process content from specific URLs for deeper analysis.
 - **Code Execution**: Run Python code in Anthropic's secure sandbox environment for calculations, data analysis, and more.
 - **Extended Thinking**: Leverage Claude's extended thinking capabilities for complex problem-solving, with configurable token budgets.
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
@@ -56,10 +57,10 @@ Hello World
 ```
 
 ### Web Search
-Claude can perform web searches to fetch up-to-date information when `ENABLE_WEB_SEARCH` is active.
+Claude can perform web searches to fetch up-to-date information when enabled via the UI's web search toggle.
 
-### TODO
-Implement web fetch tool.
+### Web Fetch
+When enabled via the URL context toggle in the UI, Claude can fetch and analyze content from specific URLs. This is useful for reading documentation, analyzing web pages, or extracting information from specific websites.
 
 ## License
 

@@ -3,12 +3,13 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.9.0
+version: 0.10.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
 - Web search capabilities
-- Code execution in a secure sandbox environment
+- Web fetch capabilities
+- Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
 - Image processing and analysis
 - Centralized model capability management
@@ -33,11 +34,11 @@ class Pipe:
             description="Whether to require user's own API key (applies to admins too).",
         )
         THINKING_BUDGET: int = Field(
-            default=16000,
+            default=8192,
             description="Token budget for Claude's extended thinking capability (max tokens to use for thinking).",
         )
         MAX_TOKENS: int = Field(
-            default=4096,
+            default=10240,
             description="Default maximum number of tokens to generate in the response.",
         )
         ENABLE_THINKING: bool = Field(
@@ -47,8 +48,8 @@ class Pipe:
 
     class UserValves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(default="")
-        THINKING_BUDGET: int = Field(default=16000)
-        MAX_TOKENS: int = Field(default=4096)
+        THINKING_BUDGET: int = Field(default=8192)
+        MAX_TOKENS: int = Field(default=10240)
         ENABLE_THINKING: bool = Field(default=True)
 
     def __init__(self):
@@ -77,7 +78,7 @@ class Pipe:
 
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
-            # Web Search: According to https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool
+            # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
@@ -90,7 +91,18 @@ class Pipe:
                 "claude-3-5-sonnet-latest",
                 "claude-3-5-haiku-latest",
             },
-            # Code Execution: According to https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/code-execution-tool
+            # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
+            "web_fetch": {
+                "claude-sonnet-4-5-20250929",
+                "claude-sonnet-4-20250514",
+                "claude-3-7-sonnet-20250219",
+                "claude-haiku-4-5-20251001",
+                "claude-3-5-haiku-latest",
+                "claude-opus-4-5-20251101",
+                "claude-opus-4-1-20250805",
+                "claude-opus-4-20250514",
+            },
+            # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
@@ -176,7 +188,11 @@ class Pipe:
             }
 
     def init_client(
-        self, user_valves=None, model_name=None, code_execution_enabled=True
+        self,
+        user_valves=None,
+        model_name=None,
+        code_execution_enabled=True,
+        web_fetch_enabled=False,
     ):
         """Initialize Anthropic client with appropriate API key and beta headers."""
         if not self.client:
@@ -197,10 +213,16 @@ class Pipe:
             # Determine required beta headers based on model capabilities
             beta_headers = []
 
-            if model_name and code_execution_enabled:
-                # Check if the model supports code execution
-                if self.supports_capability(model_name, "code_execution"):
-                    beta_headers.append("code-execution-2025-08-25")
+            if model_name:
+                if code_execution_enabled:
+                    # Check if the model supports code execution
+                    if self.supports_capability(model_name, "code_execution"):
+                        beta_headers.append("code-execution-2025-08-25")
+
+                if web_fetch_enabled:
+                    # Check if the model supports web fetch
+                    if self.supports_capability(model_name, "web_fetch"):
+                        beta_headers.append("web-fetch-2025-09-10")
 
             # Create default headers
             default_headers = {}
@@ -213,7 +235,7 @@ class Pipe:
             )
 
     def pipe(
-        self, body: dict, __user__=None, **kwargs
+        self, body: dict, __user__=None, __metadata__=None, **kwargs
     ) -> Union[str, Generator, Iterator]:
         # Get user valves if user info is provided
         user_valves = None
@@ -231,6 +253,9 @@ class Pipe:
         self.client = None
 
         features = body.get("features")
+        if not features:
+            features = body.get("metadata", {}).get("features")
+
         # Check if code execution is enabled in the UI
         code_execution_enabled = False
         if features and isinstance(features, dict):
@@ -245,6 +270,21 @@ class Pipe:
             # Disable OWUI web search
             features["web_search"] = False
 
+        # Check if web fetch is enabled via url_context toggle
+        web_fetch_enabled = False
+
+        # Check using __metadata__ if available (preferred method for toggle filters)
+        if __metadata__:
+            user_toggled_ids = __metadata__.get("filter_ids", [])
+            if "gemini_url_context_toggle" in user_toggled_ids:
+                web_fetch_enabled = True
+
+        # Fallback to checking features dict if not enabled via metadata
+        if not web_fetch_enabled:
+            if features and isinstance(features, dict):
+                # The filter sets "url_context" to True
+                web_fetch_enabled = features.get("url_context", False)
+
         # Check if thinking is enabled in valves
         thinking_enabled = (
             user_valves.ENABLE_THINKING
@@ -252,7 +292,9 @@ class Pipe:
             else self.valves.ENABLE_THINKING
         )
 
-        self.init_client(user_valves, model_name, code_execution_enabled)
+        self.init_client(
+            user_valves, model_name, code_execution_enabled, web_fetch_enabled
+        )
 
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
@@ -266,6 +308,8 @@ class Pipe:
             enabled_tools.append("code_execution")
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
             enabled_tools.append("thinking")
+        if self.supports_capability(model_name, "web_fetch") and web_fetch_enabled:
+            enabled_tools.append("web_fetch")
 
         if capabilities:
             print(f"Model {model_name} supports: {', '.join(capabilities)}")
@@ -303,21 +347,58 @@ class Pipe:
 
                 # Check for thinking blocks with signatures in the text
                 # Format: <think>\n...\n<!-- signature: ... -->\n</think>
+                # OR: <think>...</think>\n[//]: # (signature: ...) (New Markdown)
+                # OR: <think>...</think>\n<!-- signature: ... --> (Old HTML)
+                # OR: <think>...\n<!-- signature: ... --></think> (Oldest)
                 thinking_match = re.search(
-                    r"<think>(.*?)(?:<!-- signature: (.*?) -->)?\s*</think>",
+                    r"<think>(.*?)</think>",
                     content_text,
                     re.DOTALL
                 )
 
                 if thinking_match and message["role"] == "assistant":
-                    thinking_content = thinking_match.group(1).strip()
-                    signature = thinking_match.group(2)
+                    thinking_content = thinking_match.group(1)
+                    signature = None
 
-                    # Remove the thinking block from the text content
+                    # Check for signature inside (oldest format)
+                    inside_match = re.search(r"<!-- signature: (.*?) -->", thinking_content)
+                    if inside_match:
+                        signature = inside_match.group(1)
+                        thinking_content = thinking_content.replace(inside_match.group(0), "")
+                    else:
+                        # Check for signature after (HTML format)
+                        after_html_match = re.search(
+                            r"</think>\s*<!-- signature: (.*?) -->",
+                            content_text,
+                            re.DOTALL
+                        )
+                        if after_html_match:
+                            signature = after_html_match.group(1)
+                        else:
+                            # Check for signature after (Markdown format)
+                            after_md_match = re.search(
+                                r"</think>\s*\[//\]: # \(signature: (.*?)\)",
+                                content_text,
+                                re.DOTALL
+                            )
+                            if after_md_match:
+                                signature = after_md_match.group(1)
+
+                    thinking_content = thinking_content.strip()
+
+                    # Remove the thinking block and signature from the text content
+                    # Remove Markdown signature
                     text_content = re.sub(
-                        r"<think>.*?</think>\s*",
+                        r"<think>.*?</think>(?:\s*\[//\]: # \(signature: .*?\))?\s*",
                         "",
                         content_text,
+                        flags=re.DOTALL
+                    )
+                    # Remove HTML signature (if present instead)
+                    text_content = re.sub(
+                        r"<think>.*?</think>(?:\s*<!-- signature: .*? -->)?\s*",
+                        "",
+                        text_content,
                         flags=re.DOTALL
                     ).strip()
 
@@ -362,6 +443,17 @@ class Pipe:
             and code_execution_enabled
         ):
             tools.append({"type": "code_execution_20250825", "name": "code_execution"})
+
+        # Add web fetch tool if supported by model and enabled
+        if self.supports_capability(model_name, "web_fetch") and web_fetch_enabled:
+            tools.append(
+                {
+                    "type": "web_fetch_20250910",
+                    "name": "web_fetch",
+                    "max_uses": 5,
+                    "citations": {"enabled": True},
+                }
+            )
 
         # Convert to None if no tools
         tools = tools if tools else None
@@ -524,12 +616,15 @@ class Pipe:
                                 self.thinking_start_time = None
 
                             # Inject signature if present
+                            # Close the thinking block
+                            yield "\n</think>"
+
+                            # Inject signature if present
                             if self.thinking_signature:
-                                yield f"\n<!-- signature: {self.thinking_signature} -->"
+                                yield f"\n[//]: # (signature: {self.thinking_signature})"
                                 self.thinking_signature = None
 
-                            # Close the thinking block
-                            yield "\n</think>\n\n"
+                            yield "\n\n"
 
                         # Handle any tool use start (web search, code execution, etc.)
                         elif (
@@ -558,6 +653,12 @@ class Pipe:
                                     event, "index", None
                                 )
                                 yield "\n**File Operation:**\n```\n"
+
+                            elif (
+                                hasattr(event.content_block, "name")
+                                and event.content_block.name == "web_fetch"
+                            ):
+                                yield "\n**Using web fetch tool...**\n"
 
                         # Handle code execution input deltas
                         elif (
@@ -641,6 +742,20 @@ class Pipe:
 
                             yield "\n```\n\n"
 
+                        # Handle web fetch results
+                        elif (
+                            event.type == "content_block_start"
+                            and hasattr(event, "content_block")
+                            and event.content_block.type == "web_fetch_tool_result"
+                        ):
+                            # We don't want to show the full content as it might be huge, just a confirmation
+                            # or maybe the URL if available in the result content?
+                            # The documentation says content has url, content, retrieved_at
+                            # But here we just get the block start.
+                            # We can wait for the full block or just say "Fetched."
+                            # Let's try to show something useful if possible, but for now just a marker.
+                            yield "Fetched.\n\n"
+
                         # Handle tool completion - add spacing when tool finishes
                         elif event.type == "content_block_stop" and in_tool_usage:
                             # Add a newline when tool block ends to ensure proper spacing
@@ -701,10 +816,10 @@ class Pipe:
                         ):
                             signature_part = ""
                             if hasattr(content_block, "signature") and content_block.signature:
-                                signature_part = f"\n<!-- signature: {content_block.signature} -->"
+                                signature_part = f"\n[//]: # (signature: {content_block.signature})"
 
                             result_parts.append(
-                                f"<think>\n{content_block.thinking}{signature_part}\n</think>\n\n"
+                                f"<think>\n{content_block.thinking}\n</think>{signature_part}\n\n"
                             )
 
                     # Handle redacted thinking content blocks
@@ -737,6 +852,11 @@ class Pipe:
                                 if "file_text" in content_block.input:
                                     result_parts.append(f"```\n{content_block.input['file_text']}\n```\n")
 
+                        elif content_block.name == "web_fetch":
+                            if hasattr(content_block, "input") and "url" in content_block.input:
+                                url = content_block.input["url"]
+                                result_parts.append(f"\n**Web Fetch:** {url}\n")
+
                     # Handle code execution results
                     elif content_block.type == "bash_code_execution_tool_result":
                         if hasattr(content_block, "content"):
@@ -759,6 +879,9 @@ class Pipe:
                             if hasattr(content, "is_file_update"):
                                 result_parts.append("File created." if not content.is_file_update else "File updated.")
                             result_parts.append("\n```\n")
+
+                    elif content_block.type == "web_fetch_tool_result":
+                        result_parts.append("Fetched.\n\n")
 
                 return "".join(result_parts)
 

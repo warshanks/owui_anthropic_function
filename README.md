@@ -8,7 +8,7 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 ## Features
 
 - **Web Search**: Enable Claude to search the web for real-time information.
-- **Code Execution**: Run Python code in a secure sandbox environment for calculations, data analysis, and more.
+- **Code Execution**: Run Python code in Anthropic's secure sandbox environment for calculations, data analysis, and more.
 - **Extended Thinking**: Leverage Claude's extended thinking capabilities for complex problem-solving, with configurable token budgets.
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
 - **Streaming Support**: Real-time streaming of responses, including thinking blocks and code execution outputs.
@@ -57,6 +57,9 @@ Hello World
 
 ### Web Search
 Claude can perform web searches to fetch up-to-date information when `ENABLE_WEB_SEARCH` is active.
+
+### TODO
+Implement web fetch tool.
 
 ## License
 

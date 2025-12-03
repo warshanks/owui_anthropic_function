@@ -62,6 +62,8 @@ Claude can perform web searches to fetch up-to-date information when enabled via
 ### Web Fetch
 When enabled via the URL context toggle in the UI, Claude can fetch and analyze content from specific URLs. This is useful for reading documentation, analyzing web pages, or extracting information from specific websites.
 
+Uses [suurt8ll's gemini_url_context_toggle filter](https://github.com/suurt8ll/open_webui_functions/blob/master/plugins/filters/gemini_url_context_toggle.py) to enable in the UI.
+
 ## License
 
 MIT License - see the [LICENSE](LICENSE) file for details.

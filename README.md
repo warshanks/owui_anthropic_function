@@ -30,8 +30,8 @@ You can configure the pipe using **Valves**. These can be set globally by the ad
 ## Installation
 
 1. Open your Open WebUI instance.
-2. Go to **Workspace** -> **Functions**.
-3. Click **+** to create a new function.
+2. Go to **Admin Panel** -> **Functions**.
+3. Click the **+ New Function** button.
 4. Import the `anthropic_manifold.py` file or paste its content.
 5. Save and activate the function.
 

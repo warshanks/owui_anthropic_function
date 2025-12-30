@@ -24,6 +24,77 @@ from typing import List, Union, Generator, Iterator, Optional
 from pydantic import BaseModel, Field
 from open_webui.utils.misc import pop_system_message
 import anthropic
+import asyncio
+from loguru import logger
+from typing import List, Union, Generator, Iterator, Optional, Callable, Awaitable, Literal, Any, AsyncIterator
+
+
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
+log = logger.bind(auditable=False)
+
+
+class EventEmitter:
+    """A helper class to abstract web-socket event emissions to the front-end."""
+
+    def __init__(
+        self,
+        event_emitter: Callable[[dict], Awaitable[None]] | None,
+    ):
+        self.event_emitter = event_emitter
+
+    async def emit_toast(
+        self,
+        msg: str,
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        """Emits a toast notification to the front-end. This is a fire-and-forget operation."""
+        if not self.event_emitter:
+            return
+
+        event = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+
+        async def send_toast():
+            try:
+                # Re-check in case the event loop runs this later and state has changed.
+                if self.event_emitter:
+                    await self.event_emitter(event)
+            except Exception:
+                pass
+
+        asyncio.create_task(send_toast())
+
+    async def emit_completion(
+        self,
+        content: str | None = None,
+        done: bool = False,
+        error: str | None = None,
+        sources: list[dict] | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Constructs and emits completion event."""
+        if not self.event_emitter:
+            return
+
+        emission = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        if content is not None:
+            emission["data"]["content"] = content
+        if error is not None:
+            emission["data"]["error"] = {"detail": error}
+        if sources is not None:
+            emission["data"]["sources"] = sources
+        if usage is not None:
+            emission["data"]["usage"] = usage
+
+        try:
+            await self.event_emitter(emission)
+        except Exception:
+            pass
 
 
 class Pipe:
@@ -75,6 +146,7 @@ class Pipe:
         self.thinking_start_time = None
         self.is_code_execution = False
         self.code_execution_block_index = None
+        self.event_emitter = None
 
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
@@ -193,8 +265,12 @@ class Pipe:
         model_name=None,
         code_execution_enabled=True,
         web_fetch_enabled=False,
+        event_emitter=None,
     ):
         """Initialize Anthropic client with appropriate API key and beta headers."""
+        if event_emitter:
+            self.event_emitter = EventEmitter(event_emitter)
+
         if not self.client:
             # Use user's API key if provided and allowed
             api_key = None
@@ -234,9 +310,14 @@ class Pipe:
                 default_headers=default_headers if default_headers else None,
             )
 
-    def pipe(
-        self, body: dict, __user__=None, __metadata__=None, **kwargs
-    ) -> Union[str, Generator, Iterator]:
+    async def pipe(
+        self,
+        body: dict,
+        __user__=None,
+        __metadata__=None,
+        __event_emitter__=None,
+        **kwargs,
+    ) -> Union[str, Generator, Iterator, AsyncIterator]:
         # Get user valves if user info is provided
         user_valves = None
         if __user__ and hasattr(__user__, "valves") and __user__.valves:
@@ -293,8 +374,13 @@ class Pipe:
         )
 
         self.init_client(
-            user_valves, model_name, code_execution_enabled, web_fetch_enabled
+            user_valves,
+            model_name,
+            code_execution_enabled,
+            web_fetch_enabled,
+            __event_emitter__,
         )
+
 
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
@@ -547,7 +633,7 @@ class Pipe:
             print(error_msg)
             return error_msg
 
-    def stream_response_sdk(self, params):
+    async def stream_response_sdk(self, params):
         try:
             with self.client.messages.stream(**params) as stream:
                 # For extended thinking: handle thinking blocks in the stream
@@ -562,6 +648,9 @@ class Pipe:
                 processed_text_via_events = False
                 # Track when we're in tool usage to add proper spacing after tools
                 in_tool_usage = False
+
+                current_text_block_index = None
+                current_citations = []
 
                 for event in stream:
                     # Handle different event types
@@ -669,31 +758,6 @@ class Pipe:
                             and hasattr(event.delta, "partial_json")
                         ):
                             # Extract and yield content from the partial JSON
-                            # We just yield the raw JSON partials for now as they come in
-                            # to show progress, or we could try to parse specific fields.
-                            # For simplicity and robustness, let's try to extract the 'command' or 'code'
-                            # but since it's streaming JSON, it's tricky.
-                            # A simple approach is to just yield the raw partial JSON if we want debug,
-                            # but for user experience, we might want to wait or try to extract 'command' / 'code'.
-
-                            # Given the complexity of streaming JSON parsing, and that the previous
-                            # implementation tried to extract 'code', let's try to extract relevant fields.
-                            # But for Bash/Text Editor, the fields are 'command', 'path', 'file_text', etc.
-
-                            # Let's try to just print the values if we can find them in the partial string
-                            # This is a bit hacky but works for visual feedback
-
-                            import re
-
-                            # Try to find "command": "..." or "path": "..." etc
-                            # This is purely for visual feedback during stream
-
-                            # For now, let's just yield the raw partials if they look like content
-                            # or just skip detailed streaming of the input arguments to avoid broken JSON display
-                            # and wait for the block to finish?
-                            # The previous implementation yielded code.
-
-                            # Let's try to extract the value of the last key being sent
                             pass
 
                         # Handle server tool use end (close code block)
@@ -748,32 +812,115 @@ class Pipe:
                             and hasattr(event, "content_block")
                             and event.content_block.type == "web_fetch_tool_result"
                         ):
-                            # We don't want to show the full content as it might be huge, just a confirmation
-                            # or maybe the URL if available in the result content?
-                            # The documentation says content has url, content, retrieved_at
-                            # But here we just get the block start.
-                            # We can wait for the full block or just say "Fetched."
-                            # Let's try to show something useful if possible, but for now just a marker.
                             yield "Fetched.\n\n"
 
                         # Handle tool completion - add spacing when tool finishes
                         elif event.type == "content_block_stop" and in_tool_usage:
                             # Add a newline when tool block ends to ensure proper spacing
-                            # This fixes the issue where tool results run into subsequent text
                             in_tool_usage = False
                             yield "\n"
 
-                        # Handle regular text content deltas
+                        # Handle content block start for text to track index
+                        elif (
+                            event.type == "content_block_start"
+                            and hasattr(event, "content_block")
+                            and event.content_block.type == "text"
+                        ):
+                            current_text_block_index = event.index
+                            current_citations = []
+
+                        # Handle regular text content deltas with citations support
                         elif (
                             event.type == "content_block_delta"
                             and hasattr(event, "delta")
-                            and event.delta.type == "text_delta"
-                            and hasattr(event.delta, "text")
                         ):
-                            # Only yield text if we're not in thinking or code execution mode
-                            if not self.is_thinking and not self.is_code_execution:
-                                yield event.delta.text
-                                processed_text_via_events = True
+                            if event.delta.type == "text_delta" and hasattr(event.delta, "text"):
+                                # Only yield text if we're not in thinking or code execution mode
+                                if not self.is_thinking and not self.is_code_execution:
+                                    yield event.delta.text
+                                    processed_text_via_events = True
+
+                            elif event.delta.type == "citations_delta" and hasattr(event.delta, "citation"):
+                                # Handle citation delta
+                                citation = event.delta.citation
+                                current_citations.append(citation)
+
+                        # Handle content block stop for text to emit citations
+                        elif (
+                            event.type == "content_block_stop"
+                        ):
+                            # If we have collected citations for this block, emit them
+                            if current_citations and self.event_emitter:
+                                # Process citations into Open WebUI Source format
+                                sources = []
+                                for citation in current_citations:
+                                    source = {"source": {}}
+
+                                    # Handle different citation types
+                                    if citation.type == "char_location":
+                                        source["source"]["type"] = "document"
+                                        # Map to document source if possible, or generic
+                                        # The citation object has cited_text, document_index, etc.
+                                        if hasattr(citation, "cited_text"):
+                                            source["source"]["content"] = citation.cited_text
+
+                                        # Add metadata
+                                        source["source"]["metadata"] = {
+                                            "document_index": getattr(citation, "document_index", None),
+                                            "start_char_index": getattr(citation, "start_char_index", None),
+                                            "end_char_index": getattr(citation, "end_char_index", None)
+                                        }
+
+                                    elif citation.type == "page_location":
+                                        source["source"]["type"] = "document"
+                                        if hasattr(citation, "cited_text"):
+                                            source["source"]["content"] = citation.cited_text
+
+                                        source["source"]["metadata"] = {
+                                            "document_index": getattr(citation, "document_index", None),
+                                            "start_page_number": getattr(citation, "start_page_number", None),
+                                            "end_page_number": getattr(citation, "end_page_number", None)
+                                        }
+
+                                    elif citation.type == "content_block_location":
+                                        source["source"]["type"] = "document"
+                                        if hasattr(citation, "cited_text"):
+                                            source["source"]["content"] = citation.cited_text
+
+                                        source["source"]["metadata"] = {
+                                            "document_index": getattr(citation, "document_index", None),
+                                            "start_block_index": getattr(citation, "start_block_index", None),
+                                            "end_block_index": getattr(citation, "end_block_index", None)
+                                        }
+
+                                    elif hasattr(citation, "url"): # Web search/fetch citation (inferred structure)
+                                         source["source"]["type"] = "web_search_result"
+                                         source["source"]["url"] = getattr(citation, "url", "")
+                                         source["source"]["title"] = getattr(citation, "title", "Web Source")
+                                         if hasattr(citation, "cited_text"):
+                                             source["source"]["content"] = citation.cited_text
+
+                                         if hasattr(citation, "encrypted_index"):
+                                             source["source"]["metadata"] = {
+                                                 "encrypted_index": citation.encrypted_index
+                                             }
+
+                                    # Fallback/General handling
+                                    if "name" not in source["source"] and hasattr(citation, "title"):
+                                        source["source"]["name"] = citation.title
+                                    elif "url" in source["source"]:
+                                        source["source"]["name"] = source["source"]["url"]
+                                    else:
+                                        source["source"]["name"] = "Citation" # Default name
+
+                                    sources.append(source["source"])
+
+                                if sources:
+                                    await self.event_emitter.emit_completion(sources=sources)
+
+                                # Reset for next block
+                                current_citations = []
+
 
                 # Fallback to text_stream if no text was processed via events
                 # This ensures compatibility if the SDK behavior changes
@@ -799,13 +946,14 @@ class Pipe:
             print(error_msg)
             yield error_msg
 
-    def non_stream_response_sdk(self, params):
+    async def non_stream_response_sdk(self, params):
         try:
             response = self.client.messages.create(**params)
 
             # Handle different content types in the response
             if hasattr(response, "content") and response.content:
                 result_parts = []
+                all_citations = []
 
                 for content_block in response.content:
                     # Handle thinking content blocks
@@ -831,6 +979,67 @@ class Pipe:
                     # Handle text content
                     elif content_block.type == "text":
                         result_parts.append(content_block.text)
+
+                        # Collect and process citations if present
+                        if hasattr(content_block, "citations") and content_block.citations:
+                            for citation in content_block.citations:
+                                source = {"source": {}}
+
+                                # Handle different citation types
+                                if citation.type == "char_location":
+                                    source["source"]["type"] = "document"
+                                    if hasattr(citation, "cited_text"):
+                                        source["source"]["content"] = citation.cited_text
+
+                                    source["source"]["metadata"] = {
+                                        "document_index": getattr(citation, "document_index", None),
+                                        "start_char_index": getattr(citation, "start_char_index", None),
+                                        "end_char_index": getattr(citation, "end_char_index", None)
+                                    }
+
+                                elif citation.type == "page_location":
+                                    source["source"]["type"] = "document"
+                                    if hasattr(citation, "cited_text"):
+                                        source["source"]["content"] = citation.cited_text
+
+                                    source["source"]["metadata"] = {
+                                        "document_index": getattr(citation, "document_index", None),
+                                        "start_page_number": getattr(citation, "start_page_number", None),
+                                        "end_page_number": getattr(citation, "end_page_number", None)
+                                    }
+
+                                elif citation.type == "content_block_location":
+                                    source["source"]["type"] = "document"
+                                    if hasattr(citation, "cited_text"):
+                                        source["source"]["content"] = citation.cited_text
+
+                                    source["source"]["metadata"] = {
+                                        "document_index": getattr(citation, "document_index", None),
+                                        "start_block_index": getattr(citation, "start_block_index", None),
+                                        "end_block_index": getattr(citation, "end_block_index", None)
+                                    }
+
+                                elif hasattr(citation, "url"): # Web search/fetch citation (inferred structure)
+                                     source["source"]["type"] = "web_search_result"
+                                     source["source"]["url"] = getattr(citation, "url", "")
+                                     source["source"]["title"] = getattr(citation, "title", "Web Source")
+                                     if hasattr(citation, "cited_text"):
+                                         source["source"]["content"] = citation.cited_text
+
+                                     if hasattr(citation, "encrypted_index"):
+                                         source["source"]["metadata"] = {
+                                             "encrypted_index": citation.encrypted_index
+                                         }
+
+                                # Fallback/General handling
+                                if "name" not in source["source"] and hasattr(citation, "title"):
+                                    source["source"]["name"] = citation.title
+                                elif "url" in source["source"]:
+                                    source["source"]["name"] = source["source"]["url"]
+                                else:
+                                    source["source"]["name"] = "Citation" # Default name
+
+                                all_citations.append(source["source"])
 
                     # Handle code execution tool use
                     elif (
@@ -882,6 +1091,9 @@ class Pipe:
 
                     elif content_block.type == "web_fetch_tool_result":
                         result_parts.append("Fetched.\n\n")
+
+                if all_citations and self.event_emitter:
+                     await self.event_emitter.emit_completion(sources=all_citations)
 
                 return "".join(result_parts)
 

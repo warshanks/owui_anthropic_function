@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.10.0-blue)
+![Version](https://img.shields.io/badge/version-0.11.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -13,6 +13,7 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 - **Extended Thinking**: Leverage Claude's extended thinking capabilities for complex problem-solving, with configurable token budgets.
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
 - **Streaming Support**: Real-time streaming of responses, including thinking blocks and code execution outputs.
+- **Cost Tracking**: Track and display the cost of requests in real-time.
 - **Flexible Configuration**: Manage capabilities globally or per-user via Valves.
 
 ## Supported Models

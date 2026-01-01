@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.10.0
+version: 0.11.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -65,6 +65,11 @@ class EventEmitter:
                 pass
 
         asyncio.create_task(send_toast())
+
+    async def emit_usage(self, usage_data: dict[str, Any]) -> None:
+        """A wrapper around emit_completion to specifically emit usage data."""
+        await self.emit_completion(usage=usage_data)
+
 
     async def emit_completion(
         self,
@@ -198,7 +203,31 @@ class Pipe:
                 "claude-3-7-sonnet-latest",
             },
         }
-        pass
+
+        # Pricing per million tokens (Input / Output)
+        self.PRICING = {
+            # Claude 4.5 family
+            "claude-opus-4-5": {"input": 5.00, "output": 25.00},
+            "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
+            "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+
+            # Claude 4 family
+            "claude-opus-4": {"input": 15.00, "output": 75.00},
+            "claude-sonnet-4": {"input": 3.00, "output": 15.00},
+
+            # Claude 3.7
+            "claude-3-7-sonnet": {"input": 3.00, "output": 15.00},
+
+            # Claude 3.5 family
+            "claude-3-5-haiku": {"input": 0.80, "output": 4.00},
+
+            # Claude 3 family
+            "claude-3-opus": {"input": 15.00, "output": 75.00},
+            "claude-3-haiku": {"input": 0.25, "output": 1.25},
+        }
+
+        # Cost per web search request
+        self.WEB_SEARCH_COST = 0.01
 
     def get_anthropic_models(self):
         return [
@@ -221,6 +250,26 @@ class Pipe:
             if model_name in models:
                 capabilities.append(capability)
         return capabilities
+
+    def _get_pricing(self, model_name: str) -> dict[str, float]:
+        """Get pricing for a specific model."""
+        # Try exact match first
+        for key, pricing in self.PRICING.items():
+            if key in model_name:
+                return pricing
+
+        # Default or fallback (return 0s if unknown)
+        print(f"Warning: No pricing found for model {model_name}")
+        return {"input": 0.0, "output": 0.0}
+
+    def _calculate_cost(self, input_tokens: int, output_tokens: int, model_name: str, web_search_count: int = 0) -> float:
+        """Calculate total cost for the usage."""
+        pricing = self._get_pricing(model_name)
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        web_search_cost = web_search_count * self.WEB_SEARCH_COST
+        return round(input_cost + output_cost + web_search_cost, 6)
+
 
     def process_image(self, image_data):
         """Process image data with size validation."""
@@ -644,8 +693,18 @@ class Pipe:
                 self.is_code_execution = False
                 self.code_execution_block_index = None
 
+                self.is_code_execution = False
+                self.code_execution_block_index = None
+
                 # Handle streaming events - use a hybrid approach for best compatibility
                 processed_text_via_events = False
+
+                # Usage tracking
+                stream_start_time = time.time()
+                input_tokens = 0
+                output_tokens = 0
+                web_search_count = 0
+
                 # Track when we're in tool usage to add proper spacing after tools
                 in_tool_usage = False
 
@@ -655,6 +714,14 @@ class Pipe:
                 for event in stream:
                     # Handle different event types
                     if hasattr(event, "type"):
+                        # Usage tracking
+                        if event.type == "message_start" and hasattr(event, "message"):
+                            if hasattr(event.message, "usage"):
+                                input_tokens = event.message.usage.input_tokens
+
+                        elif event.type == "message_delta" and hasattr(event, "usage"):
+                            output_tokens = event.usage.output_tokens
+
                         # Handle thinking content block start
                         if (
                             event.type == "content_block_start"
@@ -748,6 +815,13 @@ class Pipe:
                                 and event.content_block.name == "web_fetch"
                             ):
                                 yield "\n**Using web fetch tool...**\n"
+
+                            elif (
+                                hasattr(event.content_block, "name")
+                                and event.content_block.name == "web_search"
+                            ):
+                                web_search_count += 1
+                                yield "\n**Searching the web...**\n"
 
                         # Handle code execution input deltas
                         elif (
@@ -929,6 +1003,21 @@ class Pipe:
                         if not self.is_thinking and not self.is_code_execution:
                             yield text
 
+            # Calculate and emit usage
+            if self.event_emitter and input_tokens > 0:
+                total_cost = self._calculate_cost(input_tokens, output_tokens, params["model"], web_search_count)
+                completion_time = time.time() - stream_start_time
+
+                usage_data = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "total_cost": total_cost,
+                    "completion_time": round(completion_time, 2)
+                }
+
+                await self.event_emitter.emit_usage(usage_data)
+
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)
@@ -948,6 +1037,7 @@ class Pipe:
 
     async def non_stream_response_sdk(self, params):
         try:
+            start_time = time.time()
             response = self.client.messages.create(**params)
 
             # Handle different content types in the response
@@ -1066,6 +1156,9 @@ class Pipe:
                                 url = content_block.input["url"]
                                 result_parts.append(f"\n**Web Fetch:** {url}\n")
 
+                        elif content_block.name == "web_search":
+                            result_parts.append(f"\n**Web Search:**\n")
+
                     # Handle code execution results
                     elif content_block.type == "bash_code_execution_tool_result":
                         if hasattr(content_block, "content"):
@@ -1094,6 +1187,37 @@ class Pipe:
 
                 if all_citations and self.event_emitter:
                      await self.event_emitter.emit_completion(sources=all_citations)
+
+                # Emit usage
+                if self.event_emitter and hasattr(response, "usage"):
+                    input_tokens = response.usage.input_tokens
+                    output_tokens = response.usage.output_tokens
+
+                    # Try to get web search count from usage if available, otherwise count properties could be used
+                    # but simpler to rely on parsing content blocks if we tracked them.
+                    # As a fallback, let's recount from content blocks for consistency or check usage
+                    web_search_count = 0
+                    if hasattr(response, "usage") and isinstance(response.usage, dict):
+                         # check dict
+                         pass
+
+                    # Manual count from content blocks is reliable for intent
+                    for block in response.content:
+                        if block.type == "server_tool_use" and block.name == "web_search":
+                             web_search_count += 1
+
+                    total_cost = self._calculate_cost(input_tokens, output_tokens, params["model"], web_search_count)
+                    completion_time = time.time() - start_time
+
+                    usage_data = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                        "total_cost": total_cost,
+                        "completion_time": round(completion_time, 2)
+                    }
+
+                    await self.event_emitter.emit_usage(usage_data)
 
                 return "".join(result_parts)
 

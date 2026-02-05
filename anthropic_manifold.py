@@ -210,6 +210,9 @@ class Pipe:
 
         # Pricing per million tokens (Input / Output)
         self.PRICING = {
+            # Claude 4.6 family
+            "claude-opus-4-6": {"input": 5.00, "output": 25.00},
+            
             # Claude 4.5 family
             "claude-opus-4-5": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},

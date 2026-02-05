@@ -157,6 +157,7 @@ class Pipe:
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-opus-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -170,6 +171,7 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-opus-4-6",
                 "claude-sonnet-4-5-20250929",
                 "claude-sonnet-4-20250514",
                 "claude-3-7-sonnet-20250219",
@@ -181,6 +183,7 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-opus-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -193,6 +196,7 @@ class Pipe:
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-opus-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -231,6 +235,7 @@ class Pipe:
 
     def get_anthropic_models(self):
         return [
+            {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
             {"id": "claude-sonnet-4-5-20250929", "name": "claude-sonnet-4-5"},
             {"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
             {"id": "claude-opus-4-5-20251101", "name": "claude-opus-4-5"},
@@ -610,45 +615,59 @@ class Pipe:
 
         # Add extended thinking capability for supported models
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
-            # Get thinking budget from user valves or default to system valve
-            thinking_budget = (
-                user_valves.THINKING_BUDGET
-                if user_valves and hasattr(user_valves, "THINKING_BUDGET")
-                else self.valves.THINKING_BUDGET
-            )
+            # Check for Opus 4.6 specifically for adaptive thinking
+            if model_name == "claude-opus-4-6":
+                params["thinking"] = {
+                    "type": "adaptive"
+                }
+                print(f"Enabling adaptive thinking for {model_name}")
 
-            # Validate thinking budget according to documentation requirements
-            if thinking_budget > 0:
-                # Minimum budget is 1,024 tokens per documentation
-                if thinking_budget < 1024:
+                # Check if streaming is required for large max_tokens (>21,333 per documentation)
+                if max_tokens > 21333 and not body.get("stream", False):
                     print(
-                        f"Thinking budget {thinking_budget} is below minimum of 1,024 tokens. Setting to minimum."
+                        f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
                     )
-                    thinking_budget = 1024
+                    body["stream"] = True
+            else:
+                # Get thinking budget from user valves or default to system valve
+                thinking_budget = (
+                    user_valves.THINKING_BUDGET
+                    if user_valves and hasattr(user_valves, "THINKING_BUDGET")
+                    else self.valves.THINKING_BUDGET
+                )
 
-                # Budget must be less than max_tokens per documentation
-                if thinking_budget >= max_tokens:
-                    print(
-                        f"Thinking budget {thinking_budget} must be less than max_tokens {max_tokens}. Disabling thinking."
-                    )
-                    thinking_budget = 0
-
+                # Validate thinking budget according to documentation requirements
                 if thinking_budget > 0:
-                    # Set the thinking budget with the required type field
-                    params["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking_budget,
-                    }
-                    print(
-                        f"Enabling extended thinking with budget: {thinking_budget} tokens, max_tokens: {max_tokens}"
-                    )
-
-                    # Check if streaming is required for large max_tokens (>21,333 per documentation)
-                    if max_tokens > 21333 and not body.get("stream", False):
+                    # Minimum budget is 1,024 tokens per documentation
+                    if thinking_budget < 1024:
                         print(
-                            f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
+                            f"Thinking budget {thinking_budget} is below minimum of 1,024 tokens. Setting to minimum."
                         )
-                        body["stream"] = True
+                        thinking_budget = 1024
+
+                    # Budget must be less than max_tokens per documentation
+                    if thinking_budget >= max_tokens:
+                        print(
+                            f"Thinking budget {thinking_budget} must be less than max_tokens {max_tokens}. Disabling thinking."
+                        )
+                        thinking_budget = 0
+
+                    if thinking_budget > 0:
+                        # Set the thinking budget with the required type field
+                        params["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": thinking_budget,
+                        }
+                        print(
+                            f"Enabling extended thinking with budget: {thinking_budget} tokens, max_tokens: {max_tokens}"
+                        )
+
+                        # Check if streaming is required for large max_tokens (>21,333 per documentation)
+                        if max_tokens > 21333 and not body.get("stream", False):
+                            print(
+                                f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
+                            )
+                            body["stream"] = True
 
         # Add optional parameters
         if system_message:

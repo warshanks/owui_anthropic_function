@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.11.0
+version: 0.12.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -158,6 +158,7 @@ class Pipe:
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
                 "claude-opus-4-6",
+                "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -172,6 +173,7 @@ class Pipe:
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
                 "claude-opus-4-6",
+                "claude-sonnet-4-6",
                 "claude-sonnet-4-5-20250929",
                 "claude-sonnet-4-20250514",
                 "claude-3-7-sonnet-20250219",
@@ -184,6 +186,7 @@ class Pipe:
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
                 "claude-opus-4-6",
+                "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -197,6 +200,7 @@ class Pipe:
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
                 "claude-opus-4-6",
+                "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
                 "claude-opus-4-1-20250805",
                 "claude-opus-4-20250514",
@@ -212,7 +216,8 @@ class Pipe:
         self.PRICING = {
             # Claude 4.6 family
             "claude-opus-4-6": {"input": 5.00, "output": 25.00},
-            
+            "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+
             # Claude 4.5 family
             "claude-opus-4-5": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
@@ -239,6 +244,7 @@ class Pipe:
     def get_anthropic_models(self):
         return [
             {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
+            {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
             {"id": "claude-sonnet-4-5-20250929", "name": "claude-sonnet-4-5"},
             {"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
             {"id": "claude-opus-4-5-20251101", "name": "claude-opus-4-5"},
@@ -618,8 +624,8 @@ class Pipe:
 
         # Add extended thinking capability for supported models
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
-            # Check for Opus 4.6 specifically for adaptive thinking
-            if model_name == "claude-opus-4-6":
+            # Check for 4.6 models for adaptive thinking
+            if model_name in ("claude-opus-4-6", "claude-sonnet-4-6"):
                 params["thinking"] = {
                     "type": "adaptive"
                 }

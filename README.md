@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.11.0-blue)
+![Version](https://img.shields.io/badge/version-0.12.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -20,9 +20,9 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 
 The pipe automatically handles capabilities for various Claude models, including:
 
-- **Claude Sonnet** (`claude-sonnet-4-5-20250929`)
+- **Claude Opus** (`claude-opus-4-6`)
+- **Claude Sonnet** (`claude-sonnet-4-6`)
 - **Claude Haiku** (`claude-haiku-4-5-20251001`)
-- **Claude Opus** (`claude-opus-4-5-20251101`, `claude-opus-4-1-20250805`, etc.)
 
 ## Configuration
 

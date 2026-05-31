@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.12.0
+version: 0.13.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -121,12 +121,33 @@ class Pipe:
             default=True,
             description="Enable Claude's extended thinking capability for supported models.",
         )
+        EFFORT: str = Field(
+            default="",
+            description=(
+                "Effort level for adaptive-thinking models (Opus 4.8/4.6, Sonnet 4.6). "
+                "One of: low, medium, high, xhigh, max. Empty = API default (high). "
+                "'xhigh' is only supported on Opus 4.8/4.7."
+            ),
+        )
+        THINKING_DISPLAY: str = Field(
+            default="summarized",
+            description=(
+                "How adaptive-thinking reasoning is returned: 'summarized' shows the "
+                "model's reasoning in <think> blocks; 'omitted' hides the reasoning "
+                "text for lower streaming latency (the <think> block still appears, "
+                "just empty). Defaults to 'summarized' so it's clear the model thought. "
+                "Note: Opus 4.8/4.7 default to 'omitted' at the API level; this valve "
+                "overrides that. You are billed for thinking tokens either way."
+            ),
+        )
 
     class UserValves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(default="")
         THINKING_BUDGET: int = Field(default=8192)
         MAX_TOKENS: int = Field(default=10240)
         ENABLE_THINKING: bool = Field(default=True)
+        EFFORT: str = Field(default="")
+        THINKING_DISPLAY: str = Field(default="")
 
     def __init__(self):
         self.type = "manifold"
@@ -157,6 +178,7 @@ class Pipe:
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -172,6 +194,7 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5-20250929",
@@ -185,6 +208,7 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -199,6 +223,7 @@ class Pipe:
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -214,6 +239,9 @@ class Pipe:
 
         # Pricing per million tokens (Input / Output)
         self.PRICING = {
+            # Claude 4.8 family
+            "claude-opus-4-8": {"input": 5.00, "output": 25.00},
+
             # Claude 4.6 family
             "claude-opus-4-6": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
@@ -243,6 +271,7 @@ class Pipe:
 
     def get_anthropic_models(self):
         return [
+            {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
             {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
             {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
             {"id": "claude-sonnet-4-5-20250929", "name": "claude-sonnet-4-5"},
@@ -624,12 +653,56 @@ class Pipe:
 
         # Add extended thinking capability for supported models
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
-            # Check for 4.6 models for adaptive thinking
-            if model_name in ("claude-opus-4-6", "claude-sonnet-4-6"):
+            # Adaptive thinking models. On Opus 4.8/4.7 this is the ONLY thinking
+            # mode (manual budget_tokens returns 400). display="summarized" is
+            # required on Opus 4.8/4.7, whose default is "omitted" (empty thinking
+            # text); on 4.6/Sonnet 4.6 it is the existing default and harmless.
+            if model_name in ("claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6"):
+                # Thinking display. Default "summarized" so the model's reasoning is
+                # visible in <think> blocks. Opus 4.8/4.7 default to "omitted" (empty
+                # thinking text) at the API level, so we set this explicitly.
+                display = (
+                    user_valves.THINKING_DISPLAY
+                    if user_valves and getattr(user_valves, "THINKING_DISPLAY", "")
+                    else self.valves.THINKING_DISPLAY
+                )
+                display = (display or "summarized").strip().lower()
+                if display not in ("summarized", "omitted"):
+                    print(
+                        f"Invalid THINKING_DISPLAY '{display}'; using 'summarized'."
+                    )
+                    display = "summarized"
                 params["thinking"] = {
-                    "type": "adaptive"
+                    "type": "adaptive",
+                    "display": display,
                 }
-                print(f"Enabling adaptive thinking for {model_name}")
+                print(f"Enabling adaptive thinking for {model_name} (display={display})")
+
+                # Optional effort guidance (output_config.effort). Sent via
+                # extra_body so it works regardless of installed SDK version.
+                effort = (
+                    user_valves.EFFORT
+                    if user_valves and getattr(user_valves, "EFFORT", "")
+                    else self.valves.EFFORT
+                )
+                effort = (effort or "").strip().lower()
+                if effort:
+                    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
+                    if effort not in valid_efforts:
+                        print(
+                            f"Invalid effort '{effort}'; valid values: {sorted(valid_efforts)}. Ignoring."
+                        )
+                    elif effort == "xhigh" and model_name not in (
+                        "claude-opus-4-8",
+                        "claude-opus-4-7",
+                    ):
+                        print(
+                            f"Effort 'xhigh' is only supported on Opus 4.8/4.7; ignoring for {model_name}."
+                        )
+                    else:
+                        extra_body = params.setdefault("extra_body", {})
+                        extra_body["output_config"] = {"effort": effort}
+                        print(f"Setting effort={effort} for {model_name}")
 
                 # Check if streaming is required for large max_tokens (>21,333 per documentation)
                 if max_tokens > 21333 and not body.get("stream", False):

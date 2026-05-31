@@ -14,6 +14,8 @@ The following table shows pricing for all Claude models across different usage t
 
 | Model             | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
 |-------------------|-------------------|-----------------|-----------------|----------------------|---------------|
+| Claude Opus 4.8   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
+| Claude Opus 4.6   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.5   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.1   | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
 | Claude Opus 4     | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
@@ -65,6 +67,8 @@ The Batch API allows asynchronous processing of large volumes of requests with a
 
 | Model             | Batch input      | Batch output    |
 |-------------------|------------------|-----------------|
+| Claude Opus 4.8     | $2.50 / MTok     | $12.50 / MTok   |
+| Claude Opus 4.6     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.5     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.1     | $7.50 / MTok     | $37.50 / MTok   |
 | Claude Opus 4     | $7.50 / MTok     | $37.50 / MTok   |

@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.12.0-blue)
+![Version](https://img.shields.io/badge/version-0.13.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -10,7 +10,9 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 - **Web Search**: Enable Claude to search the web for real-time information.
 - **Web Fetch**: Fetch and process content from specific URLs for deeper analysis.
 - **Code Execution**: Run Python code in Anthropic's secure sandbox environment for calculations, data analysis, and more.
-- **Extended Thinking**: Leverage Claude's extended thinking capabilities for complex problem-solving, with configurable token budgets.
+- **Extended Thinking**: Leverage Claude's extended thinking for complex problem-solving. Newer models (Opus 4.8/4.6, Sonnet 4.6) use **adaptive thinking** (Claude decides when and how much to think); older models use a configurable token budget.
+- **Effort Control**: Guide how much adaptive-thinking models reason via the `EFFORT` valve (`low`, `medium`, `high`, `xhigh`, `max`). `xhigh` is available on Opus 4.8.
+- **Thinking Display**: Adaptive-thinking reasoning defaults to `summarized` (shown in `<think>` blocks) via the `THINKING_DISPLAY` valve; set to `omitted` for lower latency. This overrides Opus 4.8/4.7's API-level `omitted` default so it's visible the model thought.
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
 - **Streaming Support**: Real-time streaming of responses, including thinking blocks and code execution outputs.
 - **Cost Tracking**: Track and display the cost of requests in real-time.
@@ -20,9 +22,11 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 
 The pipe automatically handles capabilities for various Claude models, including:
 
-- **Claude Opus** (`claude-opus-4-6`)
-- **Claude Sonnet** (`claude-sonnet-4-6`)
+- **Claude Opus** (`claude-opus-4-8`, `claude-opus-4-6`, `claude-opus-4-5-20251101`)
+- **Claude Sonnet** (`claude-sonnet-4-6`, `claude-sonnet-4-5-20250929`)
 - **Claude Haiku** (`claude-haiku-4-5-20251001`)
+
+Claude Opus 4.8 (`claude-opus-4-8`) is the flagship model: a 1M-token context window and 128K max output by default, with **adaptive thinking** as its only thinking mode. See [What's new in Claude 4.8](docs/claude_4-8.md).
 
 ## Configuration
 
@@ -45,7 +49,7 @@ When using a supported model, the model may utilize "thinking" blocks to reason 
 ... reasoning process ...
 </think>
 ```
-*Note: Thinking mode is only available for new conversations and requires a minimum budget of 1,024 tokens.*
+*Note: On budget-based models (e.g. Opus 4.5, Sonnet 4.5), thinking requires a minimum budget of 1,024 tokens and the budget must be less than `MAX_TOKENS`. On adaptive-thinking models (Opus 4.8/4.6, Sonnet 4.6), the budget is ignored — Claude allocates thinking automatically, optionally guided by the `EFFORT` valve. On Opus 4.8, adaptive is the only thinking mode (manual budgets are rejected by the API).*
 
 ### Code Execution
 If enabled, Claude can write and execute Python code. The code and its output (stdout/stderr) will be displayed in the chat:

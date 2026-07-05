@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.13.0
+version: 0.14.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -11,6 +11,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Web fetch capabilities
 - Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
+- Automatic prompt caching for multi-turn conversations (large input cost savings)
 - Image processing and analysis
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
@@ -26,8 +27,18 @@ from open_webui.utils.misc import pop_system_message
 import anthropic
 import asyncio
 from loguru import logger
-from typing import List, Union, Generator, Iterator, Optional, Callable, Awaitable, Literal, Any, AsyncIterator
-
+from typing import (
+    List,
+    Union,
+    Generator,
+    Iterator,
+    Optional,
+    Callable,
+    Awaitable,
+    Literal,
+    Any,
+    AsyncIterator,
+)
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
@@ -69,7 +80,6 @@ class EventEmitter:
     async def emit_usage(self, usage_data: dict[str, Any]) -> None:
         """A wrapper around emit_completion to specifically emit usage data."""
         await self.emit_completion(usage=usage_data)
-
 
     async def emit_completion(
         self,
@@ -140,6 +150,23 @@ class Pipe:
                 "overrides that. You are billed for thinking tokens either way."
             ),
         )
+        ENABLE_PROMPT_CACHING: bool = Field(
+            default=True,
+            description=(
+                "Enable automatic prompt caching. The API caches the conversation "
+                "prefix and re-reads it on follow-up turns at ~10% of the input "
+                "price instead of reprocessing the full history every request. "
+                "Has no effect on response content."
+            ),
+        )
+        CACHE_TTL: str = Field(
+            default="5m",
+            description=(
+                "Prompt cache lifetime: '5m' (default; refreshed at no cost each "
+                "time it's used) or '1h' (2x write cost; use when users typically "
+                "take more than 5 minutes between replies)."
+            ),
+        )
 
     class UserValves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(default="")
@@ -148,6 +175,8 @@ class Pipe:
         ENABLE_THINKING: bool = Field(default=True)
         EFFORT: str = Field(default="")
         THINKING_DISPLAY: str = Field(default="")
+        ENABLE_PROMPT_CACHING: bool = Field(default=True)
+        CACHE_TTL: str = Field(default="")
 
     def __init__(self):
         self.type = "manifold"
@@ -178,6 +207,8 @@ class Pipe:
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-fable-5",
+                "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
@@ -194,6 +225,8 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-fable-5",
+                "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
@@ -208,6 +241,8 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-fable-5",
+                "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
@@ -223,6 +258,8 @@ class Pipe:
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-fable-5",
+                "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
@@ -239,28 +276,25 @@ class Pipe:
 
         # Pricing per million tokens (Input / Output)
         self.PRICING = {
+            # Claude 5 family
+            "claude-fable-5": {"input": 10.00, "output": 50.00},
+            "claude-sonnet-5": {"input": 3.00, "output": 15.00},
             # Claude 4.8 family
             "claude-opus-4-8": {"input": 5.00, "output": 25.00},
-
             # Claude 4.6 family
             "claude-opus-4-6": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-
             # Claude 4.5 family
             "claude-opus-4-5": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
             "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
-
             # Claude 4 family
             "claude-opus-4": {"input": 15.00, "output": 75.00},
             "claude-sonnet-4": {"input": 3.00, "output": 15.00},
-
             # Claude 3.7
             "claude-3-7-sonnet": {"input": 3.00, "output": 15.00},
-
             # Claude 3.5 family
             "claude-3-5-haiku": {"input": 0.80, "output": 4.00},
-
             # Claude 3 family
             "claude-3-opus": {"input": 15.00, "output": 75.00},
             "claude-3-haiku": {"input": 0.25, "output": 1.25},
@@ -269,14 +303,18 @@ class Pipe:
         # Cost per web search request
         self.WEB_SEARCH_COST = 0.01
 
+        # Cache write premium over base input price (1.25x for 5m TTL,
+        # 2x for 1h TTL); updated per-request from the CACHE_TTL valve.
+        self.cache_write_multiplier = 1.25
+
     def get_anthropic_models(self):
         return [
+            {"id": "claude-fable-5", "name": "claude-fable-5"},
+            {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
-            {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
-            {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
-            {"id": "claude-sonnet-4-5-20250929", "name": "claude-sonnet-4-5"},
+            # {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
+            # {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
             {"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
-            {"id": "claude-opus-4-5-20251101", "name": "claude-opus-4-5"},
         ]
 
     def pipes(self) -> List[dict]:
@@ -305,14 +343,31 @@ class Pipe:
         print(f"Warning: No pricing found for model {model_name}")
         return {"input": 0.0, "output": 0.0}
 
-    def _calculate_cost(self, input_tokens: int, output_tokens: int, model_name: str, web_search_count: int = 0) -> float:
+    def _calculate_cost(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        model_name: str,
+        web_search_count: int = 0,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
+    ) -> float:
         """Calculate total cost for the usage."""
         pricing = self._get_pricing(model_name)
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        cache_write_cost = (
+            (cache_creation_tokens / 1_000_000)
+            * pricing["input"]
+            * self.cache_write_multiplier
+        )
+        cache_read_cost = (cache_read_tokens / 1_000_000) * pricing["input"] * 0.10
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         web_search_cost = web_search_count * self.WEB_SEARCH_COST
-        return round(input_cost + output_cost + web_search_cost, 6)
-
+        return round(
+            input_cost + cache_write_cost + cache_read_cost + output_cost
+            + web_search_cost,
+            6,
+        )
 
     def process_image(self, image_data):
         """Process image data with size validation."""
@@ -473,7 +528,6 @@ class Pipe:
             __event_emitter__,
         )
 
-
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
         enabled_tools = []
@@ -505,7 +559,9 @@ class Pipe:
                 for item in message["content"]:
                     if item["type"] == "text":
                         if item["text"]:  # Only add non-empty text blocks
-                            processed_content.append({"type": "text", "text": item["text"]})
+                            processed_content.append(
+                                {"type": "text", "text": item["text"]}
+                            )
                     elif item["type"] == "image_url":
                         processed_image = self.process_image(item)
                         processed_content.append(processed_image)
@@ -529,9 +585,7 @@ class Pipe:
                 # OR: <think>...</think>\n<!-- signature: ... --> (Old HTML)
                 # OR: <think>...\n<!-- signature: ... --></think> (Oldest)
                 thinking_match = re.search(
-                    r"<think>(.*?)</think>",
-                    content_text,
-                    re.DOTALL
+                    r"<think>(.*?)</think>", content_text, re.DOTALL
                 )
 
                 if thinking_match and message["role"] == "assistant":
@@ -539,16 +593,20 @@ class Pipe:
                     signature = None
 
                     # Check for signature inside (oldest format)
-                    inside_match = re.search(r"<!-- signature: (.*?) -->", thinking_content)
+                    inside_match = re.search(
+                        r"<!-- signature: (.*?) -->", thinking_content
+                    )
                     if inside_match:
                         signature = inside_match.group(1)
-                        thinking_content = thinking_content.replace(inside_match.group(0), "")
+                        thinking_content = thinking_content.replace(
+                            inside_match.group(0), ""
+                        )
                     else:
                         # Check for signature after (HTML format)
                         after_html_match = re.search(
                             r"</think>\s*<!-- signature: (.*?) -->",
                             content_text,
-                            re.DOTALL
+                            re.DOTALL,
                         )
                         if after_html_match:
                             signature = after_html_match.group(1)
@@ -557,7 +615,7 @@ class Pipe:
                             after_md_match = re.search(
                                 r"</think>\s*\[//\]: # \(signature: (.*?)\)",
                                 content_text,
-                                re.DOTALL
+                                re.DOTALL,
                             )
                             if after_md_match:
                                 signature = after_md_match.group(1)
@@ -570,21 +628,18 @@ class Pipe:
                         r"<think>.*?</think>(?:\s*\[//\]: # \(signature: .*?\))?\s*",
                         "",
                         content_text,
-                        flags=re.DOTALL
+                        flags=re.DOTALL,
                     )
                     # Remove HTML signature (if present instead)
                     text_content = re.sub(
                         r"<think>.*?</think>(?:\s*<!-- signature: .*? -->)?\s*",
                         "",
                         text_content,
-                        flags=re.DOTALL
+                        flags=re.DOTALL,
                     ).strip()
 
                     # Create the thinking block
-                    thinking_block = {
-                        "type": "thinking",
-                        "thinking": thinking_content
-                    }
+                    thinking_block = {"type": "thinking", "thinking": thinking_content}
 
                     if signature:
                         thinking_block["signature"] = signature
@@ -593,14 +648,9 @@ class Pipe:
 
                     # Add remaining text if any
                     if text_content:
-                        processed_content.append({
-                            "type": "text",
-                            "text": text_content
-                        })
+                        processed_content.append({"type": "text", "text": text_content})
                 else:
-                    processed_content = [
-                        {"type": "text", "text": content_text}
-                    ]
+                    processed_content = [{"type": "text", "text": content_text}]
 
             processed_messages.append(
                 {"role": message["role"], "content": processed_content}
@@ -657,7 +707,11 @@ class Pipe:
             # mode (manual budget_tokens returns 400). display="summarized" is
             # required on Opus 4.8/4.7, whose default is "omitted" (empty thinking
             # text); on 4.6/Sonnet 4.6 it is the existing default and harmless.
-            if model_name in ("claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6"):
+            if model_name in (
+                "claude-opus-4-8",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
+            ):
                 # Thinking display. Default "summarized" so the model's reasoning is
                 # visible in <think> blocks. Opus 4.8/4.7 default to "omitted" (empty
                 # thinking text) at the API level, so we set this explicitly.
@@ -668,15 +722,15 @@ class Pipe:
                 )
                 display = (display or "summarized").strip().lower()
                 if display not in ("summarized", "omitted"):
-                    print(
-                        f"Invalid THINKING_DISPLAY '{display}'; using 'summarized'."
-                    )
+                    print(f"Invalid THINKING_DISPLAY '{display}'; using 'summarized'.")
                     display = "summarized"
                 params["thinking"] = {
                     "type": "adaptive",
                     "display": display,
                 }
-                print(f"Enabling adaptive thinking for {model_name} (display={display})")
+                print(
+                    f"Enabling adaptive thinking for {model_name} (display={display})"
+                )
 
                 # Optional effort guidance (output_config.effort). Sent via
                 # extra_body so it works regardless of installed SDK version.
@@ -751,6 +805,34 @@ class Pipe:
                             )
                             body["stream"] = True
 
+        # Automatic prompt caching: a top-level cache_control makes the API
+        # place a cache breakpoint on the last cacheable block and move it
+        # forward each turn, so the growing conversation prefix is served
+        # from cache (~10% of input price) instead of reprocessed in full on
+        # every request. Prompts below the model's minimum cacheable length
+        # are silently processed without caching, so this is always safe to
+        # send. Passed via extra_body to work on any installed SDK version.
+        caching_enabled = (
+            user_valves.ENABLE_PROMPT_CACHING
+            if user_valves and hasattr(user_valves, "ENABLE_PROMPT_CACHING")
+            else self.valves.ENABLE_PROMPT_CACHING
+        )
+        if caching_enabled:
+            cache_ttl = (
+                user_valves.CACHE_TTL
+                if user_valves and getattr(user_valves, "CACHE_TTL", "")
+                else self.valves.CACHE_TTL
+            )
+            cache_ttl = (cache_ttl or "5m").strip().lower()
+            if cache_ttl not in ("5m", "1h"):
+                print(f"Invalid CACHE_TTL '{cache_ttl}'; using '5m'.")
+                cache_ttl = "5m"
+            self.cache_write_multiplier = 2.0 if cache_ttl == "1h" else 1.25
+            cache_control = {"type": "ephemeral"}
+            if cache_ttl == "1h":
+                cache_control["ttl"] = "1h"
+            params.setdefault("extra_body", {})["cache_control"] = cache_control
+
         # Add optional parameters
         if system_message:
             params["system"] = str(system_message)
@@ -804,6 +886,8 @@ class Pipe:
                 stream_start_time = time.time()
                 input_tokens = 0
                 output_tokens = 0
+                cache_creation_tokens = 0
+                cache_read_tokens = 0
                 web_search_count = 0
 
                 # Track when we're in tool usage to add proper spacing after tools
@@ -818,7 +902,15 @@ class Pipe:
                         # Usage tracking
                         if event.type == "message_start" and hasattr(event, "message"):
                             if hasattr(event.message, "usage"):
-                                input_tokens = event.message.usage.input_tokens
+                                usage = event.message.usage
+                                input_tokens = usage.input_tokens
+                                cache_creation_tokens = (
+                                    getattr(usage, "cache_creation_input_tokens", 0)
+                                    or 0
+                                )
+                                cache_read_tokens = (
+                                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                                )
 
                         elif event.type == "message_delta" and hasattr(event, "usage"):
                             output_tokens = event.usage.output_tokens
@@ -890,7 +982,7 @@ class Pipe:
                             and event.content_block.type == "server_tool_use"
                         ):
                             in_tool_usage = True
-                        # Handle code execution specifically
+                            # Handle code execution specifically
                             if (
                                 hasattr(event.content_block, "name")
                                 and event.content_block.name == "bash_code_execution"
@@ -903,7 +995,8 @@ class Pipe:
 
                             elif (
                                 hasattr(event.content_block, "name")
-                                and event.content_block.name == "text_editor_code_execution"
+                                and event.content_block.name
+                                == "text_editor_code_execution"
                             ):
                                 self.is_code_execution = True
                                 self.code_execution_block_index = getattr(
@@ -954,8 +1047,10 @@ class Pipe:
                             event.type == "content_block_start"
                             and hasattr(event, "content_block")
                             and (
-                                event.content_block.type == "bash_code_execution_tool_result"
-                                or event.content_block.type == "text_editor_code_execution_tool_result"
+                                event.content_block.type
+                                == "bash_code_execution_tool_result"
+                                or event.content_block.type
+                                == "text_editor_code_execution_tool_result"
                             )
                         ):
                             yield "\n**Output:**\n```\n"
@@ -963,21 +1058,31 @@ class Pipe:
                                 content = event.content_block.content
 
                                 # Handle Bash results
-                                if event.content_block.type == "bash_code_execution_tool_result":
+                                if (
+                                    event.content_block.type
+                                    == "bash_code_execution_tool_result"
+                                ):
                                     if hasattr(content, "stdout") and content.stdout:
                                         yield content.stdout
                                     if hasattr(content, "stderr") and content.stderr:
                                         yield f"\n**Error:**\n{content.stderr}"
 
                                 # Handle Text Editor results
-                                elif event.content_block.type == "text_editor_code_execution_tool_result":
+                                elif (
+                                    event.content_block.type
+                                    == "text_editor_code_execution_tool_result"
+                                ):
                                     if hasattr(content, "content") and content.content:
                                         yield content.content
                                     if hasattr(content, "lines") and content.lines:
                                         # Diff format
                                         yield "\n".join(content.lines)
                                     if hasattr(content, "is_file_update"):
-                                        yield "File created." if not content.is_file_update else "File updated."
+                                        yield (
+                                            "File created."
+                                            if not content.is_file_update
+                                            else "File updated."
+                                        )
 
                             yield "\n```\n\n"
 
@@ -1005,25 +1110,26 @@ class Pipe:
                             current_citations = []
 
                         # Handle regular text content deltas with citations support
-                        elif (
-                            event.type == "content_block_delta"
-                            and hasattr(event, "delta")
+                        elif event.type == "content_block_delta" and hasattr(
+                            event, "delta"
                         ):
-                            if event.delta.type == "text_delta" and hasattr(event.delta, "text"):
+                            if event.delta.type == "text_delta" and hasattr(
+                                event.delta, "text"
+                            ):
                                 # Only yield text if we're not in thinking or code execution mode
                                 if not self.is_thinking and not self.is_code_execution:
                                     yield event.delta.text
                                     processed_text_via_events = True
 
-                            elif event.delta.type == "citations_delta" and hasattr(event.delta, "citation"):
+                            elif event.delta.type == "citations_delta" and hasattr(
+                                event.delta, "citation"
+                            ):
                                 # Handle citation delta
                                 citation = event.delta.citation
                                 current_citations.append(citation)
 
                         # Handle content block stop for text to emit citations
-                        elif (
-                            event.type == "content_block_stop"
-                        ):
+                        elif event.type == "content_block_stop":
                             # If we have collected citations for this block, emit them
                             if current_citations and self.event_emitter:
                                 # Process citations into Open WebUI Source format
@@ -1037,65 +1143,104 @@ class Pipe:
                                         # Map to document source if possible, or generic
                                         # The citation object has cited_text, document_index, etc.
                                         if hasattr(citation, "cited_text"):
-                                            source["source"]["content"] = citation.cited_text
+                                            source["source"][
+                                                "content"
+                                            ] = citation.cited_text
 
                                         # Add metadata
                                         source["source"]["metadata"] = {
-                                            "document_index": getattr(citation, "document_index", None),
-                                            "start_char_index": getattr(citation, "start_char_index", None),
-                                            "end_char_index": getattr(citation, "end_char_index", None)
+                                            "document_index": getattr(
+                                                citation, "document_index", None
+                                            ),
+                                            "start_char_index": getattr(
+                                                citation, "start_char_index", None
+                                            ),
+                                            "end_char_index": getattr(
+                                                citation, "end_char_index", None
+                                            ),
                                         }
 
                                     elif citation.type == "page_location":
                                         source["source"]["type"] = "document"
                                         if hasattr(citation, "cited_text"):
-                                            source["source"]["content"] = citation.cited_text
+                                            source["source"][
+                                                "content"
+                                            ] = citation.cited_text
 
                                         source["source"]["metadata"] = {
-                                            "document_index": getattr(citation, "document_index", None),
-                                            "start_page_number": getattr(citation, "start_page_number", None),
-                                            "end_page_number": getattr(citation, "end_page_number", None)
+                                            "document_index": getattr(
+                                                citation, "document_index", None
+                                            ),
+                                            "start_page_number": getattr(
+                                                citation, "start_page_number", None
+                                            ),
+                                            "end_page_number": getattr(
+                                                citation, "end_page_number", None
+                                            ),
                                         }
 
                                     elif citation.type == "content_block_location":
                                         source["source"]["type"] = "document"
                                         if hasattr(citation, "cited_text"):
-                                            source["source"]["content"] = citation.cited_text
+                                            source["source"][
+                                                "content"
+                                            ] = citation.cited_text
 
                                         source["source"]["metadata"] = {
-                                            "document_index": getattr(citation, "document_index", None),
-                                            "start_block_index": getattr(citation, "start_block_index", None),
-                                            "end_block_index": getattr(citation, "end_block_index", None)
+                                            "document_index": getattr(
+                                                citation, "document_index", None
+                                            ),
+                                            "start_block_index": getattr(
+                                                citation, "start_block_index", None
+                                            ),
+                                            "end_block_index": getattr(
+                                                citation, "end_block_index", None
+                                            ),
                                         }
 
-                                    elif hasattr(citation, "url"): # Web search/fetch citation (inferred structure)
-                                         source["source"]["type"] = "web_search_result"
-                                         source["source"]["url"] = getattr(citation, "url", "")
-                                         source["source"]["title"] = getattr(citation, "title", "Web Source")
-                                         if hasattr(citation, "cited_text"):
-                                             source["source"]["content"] = citation.cited_text
+                                    elif hasattr(
+                                        citation, "url"
+                                    ):  # Web search/fetch citation (inferred structure)
+                                        source["source"]["type"] = "web_search_result"
+                                        source["source"]["url"] = getattr(
+                                            citation, "url", ""
+                                        )
+                                        source["source"]["title"] = getattr(
+                                            citation, "title", "Web Source"
+                                        )
+                                        if hasattr(citation, "cited_text"):
+                                            source["source"][
+                                                "content"
+                                            ] = citation.cited_text
 
-                                         if hasattr(citation, "encrypted_index"):
-                                             source["source"]["metadata"] = {
-                                                 "encrypted_index": citation.encrypted_index
-                                             }
+                                        if hasattr(citation, "encrypted_index"):
+                                            source["source"]["metadata"] = {
+                                                "encrypted_index": citation.encrypted_index
+                                            }
 
                                     # Fallback/General handling
-                                    if "name" not in source["source"] and hasattr(citation, "title"):
+                                    if "name" not in source["source"] and hasattr(
+                                        citation, "title"
+                                    ):
                                         source["source"]["name"] = citation.title
                                     elif "url" in source["source"]:
-                                        source["source"]["name"] = source["source"]["url"]
+                                        source["source"]["name"] = source["source"][
+                                            "url"
+                                        ]
                                     else:
-                                        source["source"]["name"] = "Citation" # Default name
+                                        source["source"][
+                                            "name"
+                                        ] = "Citation"  # Default name
 
                                     sources.append(source["source"])
 
                                 if sources:
-                                    await self.event_emitter.emit_completion(sources=sources)
+                                    await self.event_emitter.emit_completion(
+                                        sources=sources
+                                    )
 
                                 # Reset for next block
                                 current_citations = []
-
 
                 # Fallback to text_stream if no text was processed via events
                 # This ensures compatibility if the SDK behavior changes
@@ -1104,18 +1249,34 @@ class Pipe:
                         if not self.is_thinking and not self.is_code_execution:
                             yield text
 
-            # Calculate and emit usage
-            if self.event_emitter and input_tokens > 0:
-                total_cost = self._calculate_cost(input_tokens, output_tokens, params["model"], web_search_count)
+            # Calculate and emit usage. With prompt caching, input_tokens only
+            # counts tokens after the cache breakpoint — the cached prefix is
+            # reported separately in the cache_* fields, so sum all three for
+            # the true prompt size.
+            total_prompt_tokens = (
+                input_tokens + cache_creation_tokens + cache_read_tokens
+            )
+            if self.event_emitter and total_prompt_tokens > 0:
+                total_cost = self._calculate_cost(
+                    input_tokens,
+                    output_tokens,
+                    params["model"],
+                    web_search_count,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                )
                 completion_time = time.time() - stream_start_time
 
                 usage_data = {
-                    "prompt_tokens": input_tokens,
+                    "prompt_tokens": total_prompt_tokens,
                     "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
+                    "total_tokens": total_prompt_tokens + output_tokens,
                     "total_cost": total_cost,
-                    "completion_time": round(completion_time, 2)
+                    "completion_time": round(completion_time, 2),
                 }
+                if cache_creation_tokens or cache_read_tokens:
+                    usage_data["cache_creation_input_tokens"] = cache_creation_tokens
+                    usage_data["cache_read_input_tokens"] = cache_read_tokens
 
                 await self.event_emitter.emit_usage(usage_data)
 
@@ -1154,8 +1315,13 @@ class Pipe:
                             and content_block.thinking
                         ):
                             signature_part = ""
-                            if hasattr(content_block, "signature") and content_block.signature:
-                                signature_part = f"\n[//]: # (signature: {content_block.signature})"
+                            if (
+                                hasattr(content_block, "signature")
+                                and content_block.signature
+                            ):
+                                signature_part = (
+                                    f"\n[//]: # (signature: {content_block.signature})"
+                                )
 
                             result_parts.append(
                                 f"<think>\n{content_block.thinking}\n</think>{signature_part}\n\n"
@@ -1172,7 +1338,10 @@ class Pipe:
                         result_parts.append(content_block.text)
 
                         # Collect and process citations if present
-                        if hasattr(content_block, "citations") and content_block.citations:
+                        if (
+                            hasattr(content_block, "citations")
+                            and content_block.citations
+                        ):
                             for citation in content_block.citations:
                                 source = {"source": {}}
 
@@ -1180,80 +1349,123 @@ class Pipe:
                                 if citation.type == "char_location":
                                     source["source"]["type"] = "document"
                                     if hasattr(citation, "cited_text"):
-                                        source["source"]["content"] = citation.cited_text
+                                        source["source"][
+                                            "content"
+                                        ] = citation.cited_text
 
                                     source["source"]["metadata"] = {
-                                        "document_index": getattr(citation, "document_index", None),
-                                        "start_char_index": getattr(citation, "start_char_index", None),
-                                        "end_char_index": getattr(citation, "end_char_index", None)
+                                        "document_index": getattr(
+                                            citation, "document_index", None
+                                        ),
+                                        "start_char_index": getattr(
+                                            citation, "start_char_index", None
+                                        ),
+                                        "end_char_index": getattr(
+                                            citation, "end_char_index", None
+                                        ),
                                     }
 
                                 elif citation.type == "page_location":
                                     source["source"]["type"] = "document"
                                     if hasattr(citation, "cited_text"):
-                                        source["source"]["content"] = citation.cited_text
+                                        source["source"][
+                                            "content"
+                                        ] = citation.cited_text
 
                                     source["source"]["metadata"] = {
-                                        "document_index": getattr(citation, "document_index", None),
-                                        "start_page_number": getattr(citation, "start_page_number", None),
-                                        "end_page_number": getattr(citation, "end_page_number", None)
+                                        "document_index": getattr(
+                                            citation, "document_index", None
+                                        ),
+                                        "start_page_number": getattr(
+                                            citation, "start_page_number", None
+                                        ),
+                                        "end_page_number": getattr(
+                                            citation, "end_page_number", None
+                                        ),
                                     }
 
                                 elif citation.type == "content_block_location":
                                     source["source"]["type"] = "document"
                                     if hasattr(citation, "cited_text"):
-                                        source["source"]["content"] = citation.cited_text
+                                        source["source"][
+                                            "content"
+                                        ] = citation.cited_text
 
                                     source["source"]["metadata"] = {
-                                        "document_index": getattr(citation, "document_index", None),
-                                        "start_block_index": getattr(citation, "start_block_index", None),
-                                        "end_block_index": getattr(citation, "end_block_index", None)
+                                        "document_index": getattr(
+                                            citation, "document_index", None
+                                        ),
+                                        "start_block_index": getattr(
+                                            citation, "start_block_index", None
+                                        ),
+                                        "end_block_index": getattr(
+                                            citation, "end_block_index", None
+                                        ),
                                     }
 
-                                elif hasattr(citation, "url"): # Web search/fetch citation (inferred structure)
-                                     source["source"]["type"] = "web_search_result"
-                                     source["source"]["url"] = getattr(citation, "url", "")
-                                     source["source"]["title"] = getattr(citation, "title", "Web Source")
-                                     if hasattr(citation, "cited_text"):
-                                         source["source"]["content"] = citation.cited_text
+                                elif hasattr(
+                                    citation, "url"
+                                ):  # Web search/fetch citation (inferred structure)
+                                    source["source"]["type"] = "web_search_result"
+                                    source["source"]["url"] = getattr(
+                                        citation, "url", ""
+                                    )
+                                    source["source"]["title"] = getattr(
+                                        citation, "title", "Web Source"
+                                    )
+                                    if hasattr(citation, "cited_text"):
+                                        source["source"][
+                                            "content"
+                                        ] = citation.cited_text
 
-                                     if hasattr(citation, "encrypted_index"):
-                                         source["source"]["metadata"] = {
-                                             "encrypted_index": citation.encrypted_index
-                                         }
+                                    if hasattr(citation, "encrypted_index"):
+                                        source["source"]["metadata"] = {
+                                            "encrypted_index": citation.encrypted_index
+                                        }
 
                                 # Fallback/General handling
-                                if "name" not in source["source"] and hasattr(citation, "title"):
+                                if "name" not in source["source"] and hasattr(
+                                    citation, "title"
+                                ):
                                     source["source"]["name"] = citation.title
                                 elif "url" in source["source"]:
                                     source["source"]["name"] = source["source"]["url"]
                                 else:
-                                    source["source"]["name"] = "Citation" # Default name
+                                    source["source"][
+                                        "name"
+                                    ] = "Citation"  # Default name
 
                                 all_citations.append(source["source"])
 
                     # Handle code execution tool use
-                    elif (
-                        content_block.type == "server_tool_use"
-                    ):
+                    elif content_block.type == "server_tool_use":
                         if content_block.name == "bash_code_execution":
                             if (
                                 hasattr(content_block, "input")
                                 and "command" in content_block.input
                             ):
                                 command = content_block.input["command"]
-                                result_parts.append(f"\n**Bash Command:**\n```bash\n{command}\n```\n")
+                                result_parts.append(
+                                    f"\n**Bash Command:**\n```bash\n{command}\n```\n"
+                                )
 
                         elif content_block.name == "text_editor_code_execution":
-                             if hasattr(content_block, "input"):
+                            if hasattr(content_block, "input"):
                                 cmd = content_block.input.get("command", "")
                                 path = content_block.input.get("path", "")
-                                result_parts.append(f"\n**File Operation ({cmd}):** {path}\n")
+                                result_parts.append(
+                                    f"\n**File Operation ({cmd}):** {path}\n"
+                                )
                                 if "file_text" in content_block.input:
-                                    result_parts.append(f"```\n{content_block.input['file_text']}\n```\n")
+                                    result_parts.append(
+                                        f"```\n{content_block.input['file_text']}\n```\n"
+                                    )
 
                         elif content_block.name == "web_fetch":
-                            if hasattr(content_block, "input") and "url" in content_block.input:
+                            if (
+                                hasattr(content_block, "input")
+                                and "url" in content_block.input
+                            ):
                                 url = content_block.input["url"]
                                 result_parts.append(f"\n**Web Fetch:** {url}\n")
 
@@ -1280,43 +1492,73 @@ class Pipe:
                             if hasattr(content, "lines") and content.lines:
                                 result_parts.append("\n".join(content.lines))
                             if hasattr(content, "is_file_update"):
-                                result_parts.append("File created." if not content.is_file_update else "File updated.")
+                                result_parts.append(
+                                    "File created."
+                                    if not content.is_file_update
+                                    else "File updated."
+                                )
                             result_parts.append("\n```\n")
 
                     elif content_block.type == "web_fetch_tool_result":
                         result_parts.append("Fetched.\n\n")
 
                 if all_citations and self.event_emitter:
-                     await self.event_emitter.emit_completion(sources=all_citations)
+                    await self.event_emitter.emit_completion(sources=all_citations)
 
                 # Emit usage
                 if self.event_emitter and hasattr(response, "usage"):
                     input_tokens = response.usage.input_tokens
                     output_tokens = response.usage.output_tokens
+                    cache_creation_tokens = (
+                        getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                    )
+                    cache_read_tokens = (
+                        getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                    )
 
                     # Try to get web search count from usage if available, otherwise count properties could be used
                     # but simpler to rely on parsing content blocks if we tracked them.
                     # As a fallback, let's recount from content blocks for consistency or check usage
                     web_search_count = 0
                     if hasattr(response, "usage") and isinstance(response.usage, dict):
-                         # check dict
-                         pass
+                        # check dict
+                        pass
 
                     # Manual count from content blocks is reliable for intent
                     for block in response.content:
-                        if block.type == "server_tool_use" and block.name == "web_search":
-                             web_search_count += 1
+                        if (
+                            block.type == "server_tool_use"
+                            and block.name == "web_search"
+                        ):
+                            web_search_count += 1
 
-                    total_cost = self._calculate_cost(input_tokens, output_tokens, params["model"], web_search_count)
+                    total_cost = self._calculate_cost(
+                        input_tokens,
+                        output_tokens,
+                        params["model"],
+                        web_search_count,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    )
                     completion_time = time.time() - start_time
 
+                    # input_tokens only counts tokens after the cache
+                    # breakpoint; add the cached prefix for the true total.
+                    total_prompt_tokens = (
+                        input_tokens + cache_creation_tokens + cache_read_tokens
+                    )
                     usage_data = {
-                        "prompt_tokens": input_tokens,
+                        "prompt_tokens": total_prompt_tokens,
                         "completion_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
+                        "total_tokens": total_prompt_tokens + output_tokens,
                         "total_cost": total_cost,
-                        "completion_time": round(completion_time, 2)
+                        "completion_time": round(completion_time, 2),
                     }
+                    if cache_creation_tokens or cache_read_tokens:
+                        usage_data["cache_creation_input_tokens"] = (
+                            cache_creation_tokens
+                        )
+                        usage_data["cache_read_input_tokens"] = cache_read_tokens
 
                     await self.event_emitter.emit_usage(usage_data)
 

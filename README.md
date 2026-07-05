@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.13.0-blue)
+![Version](https://img.shields.io/badge/version-0.14.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -13,6 +13,7 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 - **Extended Thinking**: Leverage Claude's extended thinking for complex problem-solving. Newer models (Opus 4.8/4.6, Sonnet 4.6) use **adaptive thinking** (Claude decides when and how much to think); older models use a configurable token budget.
 - **Effort Control**: Guide how much adaptive-thinking models reason via the `EFFORT` valve (`low`, `medium`, `high`, `xhigh`, `max`). `xhigh` is available on Opus 4.8.
 - **Thinking Display**: Adaptive-thinking reasoning defaults to `summarized` (shown in `<think>` blocks) via the `THINKING_DISPLAY` valve; set to `omitted` for lower latency. This overrides Opus 4.8/4.7's API-level `omitted` default so it's visible the model thought.
+- **Prompt Caching**: Automatic caching of the conversation prefix (`ENABLE_PROMPT_CACHING` valve, on by default). Follow-up turns re-read prior history at ~10% of the input price instead of reprocessing it in full. The `CACHE_TTL` valve selects a `5m` (default) or `1h` cache lifetime.
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
 - **Streaming Support**: Real-time streaming of responses, including thinking blocks and code execution outputs.
 - **Cost Tracking**: Track and display the cost of requests in real-time.
@@ -60,6 +61,9 @@ print("Hello World")
 ```
 Hello World
 ```
+
+### Prompt Caching
+Enabled by default. Each request caches the conversation up to the newest message; the next turn in the same chat reads that prefix from cache at ~10% of the input price (cache writes cost 1.25x, so caching pays for itself from the second turn onward). Cache hits require the prefix to be byte-identical, so toggling web search / code execution / thinking or switching models mid-chat starts a fresh cache. Very short conversations below the model's minimum cacheable length (~1-4K tokens depending on model) are processed normally without caching. Cache read/write token counts appear in the usage stats and are included in the cost calculation.
 
 ### Web Search
 Claude can perform web searches to fetch up-to-date information when enabled via the UI's web search toggle.

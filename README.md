@@ -1,14 +1,14 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.15.0-blue)
+![Version](https://img.shields.io/badge/version-0.16.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
 
 ## Features
 
-- **Web Search**: Enable Claude to search the web for real-time information.
-- **Web Fetch**: Fetch and process content from specific URLs for deeper analysis.
+- **Web Search**: Enable Claude to search the web for real-time information. On Claude 4.6+ models the pipe uses the dynamic-filtering tool version, so Claude filters results with code before they reach the context window (fewer input tokens on search-heavy turns).
+- **Web Fetch**: Fetch and process content from specific URLs for deeper analysis, with the same dynamic filtering on Claude 4.6+ models.
 - **Code Execution**: Run Python code in Anthropic's secure sandbox environment for calculations, data analysis, and more.
 - **Extended Thinking**: Leverage Claude's extended thinking for complex problem-solving. Newer models (Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.6, Sonnet 4.6) use **adaptive thinking** (Claude decides when and how much to think); older models use a configurable token budget. On Opus 5 thinking is on by default at the API level, so `ENABLE_THINKING=false` is sent as an explicit disabled config.
 - **Effort Control**: Guide how much adaptive-thinking models reason via the `EFFORT` valve (`low`, `medium`, `high`, `xhigh`, `max`). `xhigh` is available everywhere except Opus 4.6 / Sonnet 4.6.
@@ -71,6 +71,8 @@ Enabled by default. Each request caches the conversation up to the newest messag
 
 ### Web Search
 Claude can perform web searches to fetch up-to-date information when enabled via the UI's web search toggle.
+
+On Claude 4.6 and later models (Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.6, Sonnet 4.6) the pipe sends `web_search_20260318` / `web_fetch_20260318`, which filter results with code before they enter the context window. That filtering runs in a sandbox the API provisions itself, so it can't be combined with an explicitly declared code execution tool: if you also turn on the code interpreter, the request falls back to the basic `web_search_20250305` / `web_fetch_20250910` versions. Older models always use the basic versions. The filtering code is never rendered into the chat — code execution blocks are only shown when you enabled code execution yourself.
 
 ### Web Fetch
 When enabled via the URL context toggle in the UI, Claude can fetch and analyze content from specific URLs. This is useful for reading documentation, analyzing web pages, or extracting information from specific websites.

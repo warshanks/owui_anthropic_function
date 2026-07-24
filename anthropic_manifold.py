@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.14.0
+version: 0.15.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -15,6 +15,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Image processing and analysis
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
+- Safety-classifier refusals surfaced instead of returning an empty response
 """
 
 import os
@@ -129,14 +130,20 @@ class Pipe:
         )
         ENABLE_THINKING: bool = Field(
             default=True,
-            description="Enable Claude's extended thinking capability for supported models.",
+            description=(
+                "Enable Claude's extended thinking capability for supported models. "
+                "On Opus 5 thinking is on by default at the API level, so turning "
+                "this off sends an explicit disabled config. Fable 5 always thinks "
+                "(the API rejects disabling it), so this valve has no effect there."
+            ),
         )
         EFFORT: str = Field(
             default="",
             description=(
-                "Effort level for adaptive-thinking models (Opus 4.8/4.6, Sonnet 4.6). "
+                "Effort level for adaptive-thinking models (Opus 5, Fable 5, "
+                "Sonnet 5, Opus 4.8, Opus 4.6, Sonnet 4.6). "
                 "One of: low, medium, high, xhigh, max. Empty = API default (high). "
-                "'xhigh' is only supported on Opus 4.8/4.7."
+                "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6."
             ),
         )
         THINKING_DISPLAY: str = Field(
@@ -146,8 +153,9 @@ class Pipe:
                 "model's reasoning in <think> blocks; 'omitted' hides the reasoning "
                 "text for lower streaming latency (the <think> block still appears, "
                 "just empty). Defaults to 'summarized' so it's clear the model thought. "
-                "Note: Opus 4.8/4.7 default to 'omitted' at the API level; this valve "
-                "overrides that. You are billed for thinking tokens either way."
+                "Note: Opus 5, Fable 5, Sonnet 5 and Opus 4.8 default to 'omitted' at "
+                "the API level; this valve overrides that. You are billed for thinking "
+                "tokens either way."
             ),
         )
         ENABLE_PROMPT_CACHING: bool = Field(
@@ -207,6 +215,7 @@ class Pipe:
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -225,6 +234,7 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -241,6 +251,7 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -258,6 +269,7 @@ class Pipe:
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -274,9 +286,35 @@ class Pipe:
             },
         }
 
+        # Models where adaptive thinking is the only supported mode. Manual
+        # thinking (`{"type": "enabled", "budget_tokens": N}`) is rejected with
+        # a 400 on all of these, so they must never take the budget path.
+        self.ADAPTIVE_THINKING_MODELS = {
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        }
+
+        # Adaptive-thinking models that do not accept effort "xhigh"
+        # (Opus 4.6 / Sonnet 4.6 support low/medium/high/max only).
+        self.NO_XHIGH_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6"}
+
+        # Models that think when the `thinking` parameter is omitted, so
+        # honoring ENABLE_THINKING=False requires sending an explicit
+        # `{"type": "disabled"}` config rather than leaving it out.
+        self.THINKING_ON_BY_DEFAULT_MODELS = {"claude-opus-5", "claude-fable-5"}
+
+        # Models that reject `{"type": "disabled"}` outright — thinking is
+        # always on and the parameter has to be omitted entirely.
+        self.THINKING_ALWAYS_ON_MODELS = {"claude-fable-5"}
+
         # Pricing per million tokens (Input / Output)
         self.PRICING = {
             # Claude 5 family
+            "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
             "claude-sonnet-5": {"input": 3.00, "output": 15.00},
             # Claude 4.8 family
@@ -309,6 +347,7 @@ class Pipe:
 
     def get_anthropic_models(self):
         return [
+            {"id": "claude-opus-5", "name": "claude-opus-5"},
             {"id": "claude-fable-5", "name": "claude-fable-5"},
             {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
@@ -368,6 +407,25 @@ class Pipe:
             + web_search_cost,
             6,
         )
+
+    def _refusal_notice(self, stop_details=None) -> str:
+        """Build a user-facing notice for a `stop_reason: "refusal"` response.
+
+        Opus 5 (like Fable 5) runs safety classifiers that can decline a
+        request. That comes back as a successful HTTP 200 with an empty or
+        partial content list, so without this the user would just see a blank
+        reply with no explanation.
+        """
+        category = getattr(stop_details, "category", None)
+        explanation = getattr(stop_details, "explanation", None)
+        detail = f" (category: {category})" if category else ""
+        notice = (
+            f"\n\n*[Anthropic's safety system declined this request{detail}. "
+            "Try rephrasing it, or select a different model.]*\n"
+        )
+        if explanation:
+            notice += f"\n*{explanation}*\n"
+        return notice
 
     def process_image(self, image_data):
         """Process image data with size validation."""
@@ -703,18 +761,16 @@ class Pipe:
 
         # Add extended thinking capability for supported models
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
-            # Adaptive thinking models. On Opus 4.8/4.7 this is the ONLY thinking
-            # mode (manual budget_tokens returns 400). display="summarized" is
-            # required on Opus 4.8/4.7, whose default is "omitted" (empty thinking
-            # text); on 4.6/Sonnet 4.6 it is the existing default and harmless.
-            if model_name in (
-                "claude-opus-4-8",
-                "claude-opus-4-6",
-                "claude-sonnet-4-6",
-            ):
+            # Adaptive thinking models. On Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
+            # this is the ONLY thinking mode (manual budget_tokens returns 400).
+            # display="summarized" is required on those models, whose default is
+            # "omitted" (empty thinking text); on Opus 4.6 / Sonnet 4.6 it is the
+            # existing default and harmless.
+            if model_name in self.ADAPTIVE_THINKING_MODELS:
                 # Thinking display. Default "summarized" so the model's reasoning is
-                # visible in <think> blocks. Opus 4.8/4.7 default to "omitted" (empty
-                # thinking text) at the API level, so we set this explicitly.
+                # visible in <think> blocks. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
+                # default to "omitted" (empty thinking text) at the API level, so we
+                # set this explicitly.
                 display = (
                     user_valves.THINKING_DISPLAY
                     if user_valves and getattr(user_valves, "THINKING_DISPLAY", "")
@@ -746,12 +802,10 @@ class Pipe:
                         print(
                             f"Invalid effort '{effort}'; valid values: {sorted(valid_efforts)}. Ignoring."
                         )
-                    elif effort == "xhigh" and model_name not in (
-                        "claude-opus-4-8",
-                        "claude-opus-4-7",
-                    ):
+                    elif effort == "xhigh" and model_name in self.NO_XHIGH_MODELS:
                         print(
-                            f"Effort 'xhigh' is only supported on Opus 4.8/4.7; ignoring for {model_name}."
+                            f"Effort 'xhigh' is not supported on {model_name} "
+                            "(Opus 4.6 / Sonnet 4.6); ignoring."
                         )
                     else:
                         extra_body = params.setdefault("extra_body", {})
@@ -804,6 +858,22 @@ class Pipe:
                                 f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
                             )
                             body["stream"] = True
+        elif (
+            model_name in self.THINKING_ON_BY_DEFAULT_MODELS
+            and model_name not in self.THINKING_ALWAYS_ON_MODELS
+        ):
+            # Opus 5 thinks when `thinking` is omitted, so ENABLE_THINKING=False
+            # has to be sent explicitly. The API only accepts a disabled config at
+            # effort "high" or below, and effort is only sent alongside adaptive
+            # thinking above, so the API default (high) applies here.
+            params["thinking"] = {"type": "disabled"}
+            print(f"Disabling thinking for {model_name} (thinking is on by default)")
+        elif model_name in self.THINKING_ALWAYS_ON_MODELS:
+            # Fable 5 rejects `{"type": "disabled"}` at any effort — thinking is
+            # always on and the parameter must be omitted entirely.
+            print(
+                f"Thinking cannot be disabled on {model_name}; leaving it on (API default)."
+            )
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -893,6 +963,10 @@ class Pipe:
                 # Track when we're in tool usage to add proper spacing after tools
                 in_tool_usage = False
 
+                # Safety-classifier refusal tracking (stop_reason "refusal")
+                refused = False
+                refusal_stop_details = None
+
                 current_text_block_index = None
                 current_citations = []
 
@@ -912,8 +986,18 @@ class Pipe:
                                     getattr(usage, "cache_read_input_tokens", 0) or 0
                                 )
 
-                        elif event.type == "message_delta" and hasattr(event, "usage"):
-                            output_tokens = event.usage.output_tokens
+                        elif event.type == "message_delta":
+                            if hasattr(event, "usage"):
+                                output_tokens = event.usage.output_tokens
+                            # A safety classifier can decline the request
+                            # mid-stream (or before any output) — the stream
+                            # ends normally, so surface it explicitly.
+                            delta = getattr(event, "delta", None)
+                            if getattr(delta, "stop_reason", None) == "refusal":
+                                refused = True
+                                refusal_stop_details = getattr(
+                                    delta, "stop_details", None
+                                )
 
                         # Handle thinking content block start
                         if (
@@ -1249,6 +1333,13 @@ class Pipe:
                         if not self.is_thinking and not self.is_code_execution:
                             yield text
 
+                if refused:
+                    print(
+                        "Request declined by Anthropic's safety classifiers "
+                        f"(model: {params['model']})."
+                    )
+                    yield self._refusal_notice(refusal_stop_details)
+
             # Calculate and emit usage. With prompt caching, input_tokens only
             # counts tokens after the cache breakpoint — the cached prefix is
             # reported separately in the cache_* fields, so sum all three for
@@ -1301,6 +1392,18 @@ class Pipe:
         try:
             start_time = time.time()
             response = self.client.messages.create(**params)
+
+            # A safety classifier may decline the request: HTTP 200 with
+            # stop_reason "refusal" and empty (or partial) content.
+            refusal_notice = ""
+            if getattr(response, "stop_reason", None) == "refusal":
+                refusal_notice = self._refusal_notice(
+                    getattr(response, "stop_details", None)
+                )
+                print(
+                    "Request declined by Anthropic's safety classifiers "
+                    f"(model: {params['model']})."
+                )
 
             # Handle different content types in the response
             if hasattr(response, "content") and response.content:
@@ -1562,9 +1665,12 @@ class Pipe:
 
                     await self.event_emitter.emit_usage(usage_data)
 
+                if refusal_notice:
+                    result_parts.append(refusal_notice)
+
                 return "".join(result_parts)
 
-            return ""
+            return refusal_notice
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)

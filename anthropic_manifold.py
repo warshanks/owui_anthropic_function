@@ -3,18 +3,19 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.14.0
+version: 0.16.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
-- Web search capabilities
-- Web fetch capabilities
+- Web search capabilities (dynamic result filtering on Claude 4.6+ models)
+- Web fetch capabilities (dynamic content filtering on Claude 4.6+ models)
 - Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
 - Automatic prompt caching for multi-turn conversations (large input cost savings)
 - Image processing and analysis
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
+- Safety-classifier refusals surfaced instead of returning an empty response
 """
 
 import os
@@ -129,14 +130,20 @@ class Pipe:
         )
         ENABLE_THINKING: bool = Field(
             default=True,
-            description="Enable Claude's extended thinking capability for supported models.",
+            description=(
+                "Enable Claude's extended thinking capability for supported models. "
+                "On Opus 5 thinking is on by default at the API level, so turning "
+                "this off sends an explicit disabled config. Fable 5 always thinks "
+                "(the API rejects disabling it), so this valve has no effect there."
+            ),
         )
         EFFORT: str = Field(
             default="",
             description=(
-                "Effort level for adaptive-thinking models (Opus 4.8/4.6, Sonnet 4.6). "
+                "Effort level for adaptive-thinking models (Opus 5, Fable 5, "
+                "Sonnet 5, Opus 4.8, Opus 4.6, Sonnet 4.6). "
                 "One of: low, medium, high, xhigh, max. Empty = API default (high). "
-                "'xhigh' is only supported on Opus 4.8/4.7."
+                "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6."
             ),
         )
         THINKING_DISPLAY: str = Field(
@@ -146,8 +153,9 @@ class Pipe:
                 "model's reasoning in <think> blocks; 'omitted' hides the reasoning "
                 "text for lower streaming latency (the <think> block still appears, "
                 "just empty). Defaults to 'summarized' so it's clear the model thought. "
-                "Note: Opus 4.8/4.7 default to 'omitted' at the API level; this valve "
-                "overrides that. You are billed for thinking tokens either way."
+                "Note: Opus 5, Fable 5, Sonnet 5 and Opus 4.8 default to 'omitted' at "
+                "the API level; this valve overrides that. You are billed for thinking "
+                "tokens either way."
             ),
         )
         ENABLE_PROMPT_CACHING: bool = Field(
@@ -201,12 +209,16 @@ class Pipe:
         self.thinking_start_time = None
         self.is_code_execution = False
         self.code_execution_block_index = None
+        # Whether code execution blocks are rendered into the chat (only when
+        # the user asked for code execution — see _code_execution_declared).
+        self.show_code_execution = True
         self.event_emitter = None
 
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -225,6 +237,7 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -241,6 +254,7 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -256,8 +270,22 @@ class Pipe:
                 "claude-3-7-sonnet-latest",
                 "claude-3-5-haiku-latest",
             },
+            # Dynamic filtering for the web tools (web_search_20260318 /
+            # web_fetch_20260318): Claude writes and runs code that filters
+            # results before they reach the context window, cutting tokens on
+            # search-heavy turns. Available on Claude 4.6 and later models.
+            # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+            "dynamic_web_tools": {
+                "claude-opus-5",
+                "claude-fable-5",
+                "claude-sonnet-5",
+                "claude-opus-4-8",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
+            },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -274,9 +302,35 @@ class Pipe:
             },
         }
 
+        # Models where adaptive thinking is the only supported mode. Manual
+        # thinking (`{"type": "enabled", "budget_tokens": N}`) is rejected with
+        # a 400 on all of these, so they must never take the budget path.
+        self.ADAPTIVE_THINKING_MODELS = {
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        }
+
+        # Adaptive-thinking models that do not accept effort "xhigh"
+        # (Opus 4.6 / Sonnet 4.6 support low/medium/high/max only).
+        self.NO_XHIGH_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6"}
+
+        # Models that think when the `thinking` parameter is omitted, so
+        # honoring ENABLE_THINKING=False requires sending an explicit
+        # `{"type": "disabled"}` config rather than leaving it out.
+        self.THINKING_ON_BY_DEFAULT_MODELS = {"claude-opus-5", "claude-fable-5"}
+
+        # Models that reject `{"type": "disabled"}` outright — thinking is
+        # always on and the parameter has to be omitted entirely.
+        self.THINKING_ALWAYS_ON_MODELS = {"claude-fable-5"}
+
         # Pricing per million tokens (Input / Output)
         self.PRICING = {
             # Claude 5 family
+            "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
             "claude-sonnet-5": {"input": 3.00, "output": 15.00},
             # Claude 4.8 family
@@ -309,6 +363,7 @@ class Pipe:
 
     def get_anthropic_models(self):
         return [
+            {"id": "claude-opus-5", "name": "claude-opus-5"},
             {"id": "claude-fable-5", "name": "claude-fable-5"},
             {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
@@ -369,6 +424,39 @@ class Pipe:
             6,
         )
 
+    def _code_execution_declared(self, params) -> bool:
+        """Whether this request declares the code execution tool itself.
+
+        The dynamic-filtering web tools run their filtering code in a sandbox
+        the API provisions on its own, so bash and file-operation blocks come
+        back even when the user only asked for web search. Those are filtering
+        internals rather than the user's code execution, so they are not
+        rendered into the chat.
+        """
+        return any(
+            isinstance(tool, dict) and tool.get("name") == "code_execution"
+            for tool in (params.get("tools") or [])
+        )
+
+    def _refusal_notice(self, stop_details=None) -> str:
+        """Build a user-facing notice for a `stop_reason: "refusal"` response.
+
+        Opus 5 (like Fable 5) runs safety classifiers that can decline a
+        request. That comes back as a successful HTTP 200 with an empty or
+        partial content list, so without this the user would just see a blank
+        reply with no explanation.
+        """
+        category = getattr(stop_details, "category", None)
+        explanation = getattr(stop_details, "explanation", None)
+        detail = f" (category: {category})" if category else ""
+        notice = (
+            f"\n\n*[Anthropic's safety system declined this request{detail}. "
+            "Try rephrasing it, or select a different model.]*\n"
+        )
+        if explanation:
+            notice += f"\n*{explanation}*\n"
+        return notice
+
     def process_image(self, image_data):
         """Process image data with size validation."""
         if image_data["image_url"]["url"].startswith("data:image"):
@@ -413,6 +501,7 @@ class Pipe:
         code_execution_enabled=True,
         web_fetch_enabled=False,
         event_emitter=None,
+        dynamic_web_tools=False,
     ):
         """Initialize Anthropic client with appropriate API key and beta headers."""
         if event_emitter:
@@ -442,8 +531,9 @@ class Pipe:
                     if self.supports_capability(model_name, "code_execution"):
                         beta_headers.append("code-execution-2025-08-25")
 
-                if web_fetch_enabled:
-                    # Check if the model supports web fetch
+                if web_fetch_enabled and not dynamic_web_tools:
+                    # Only the basic web_fetch_20250910 version needs this beta
+                    # header; the dynamic-filtering versions are GA.
                     if self.supports_capability(model_name, "web_fetch"):
                         beta_headers.append("web-fetch-2025-09-10")
 
@@ -520,12 +610,28 @@ class Pipe:
             else self.valves.ENABLE_THINKING
         )
 
+        # Pick the web tool versions for this request. The dynamic-filtering
+        # versions run their filtering code inside a code execution sandbox that
+        # the API provisions itself, so the code execution tool must not also be
+        # declared in the same request — a second execution environment confuses
+        # the model, and the pipe declares an older code execution version than
+        # dynamic filtering calls into. When the user has the code interpreter
+        # toggled on, their code execution wins and the basic web tools are used.
+        code_execution_requested = code_execution_enabled and self.supports_capability(
+            model_name, "code_execution"
+        )
+        use_dynamic_web_tools = (
+            self.supports_capability(model_name, "dynamic_web_tools")
+            and not code_execution_requested
+        )
+
         self.init_client(
             user_valves,
             model_name,
             code_execution_enabled,
             web_fetch_enabled,
             __event_emitter__,
+            dynamic_web_tools=use_dynamic_web_tools,
         )
 
         # Log model capabilities for debugging
@@ -547,6 +653,8 @@ class Pipe:
             print(f"Model {model_name} supports: {', '.join(capabilities)}")
         if enabled_tools:
             print(f"Enabled tools for {model_name}: {', '.join(enabled_tools)}")
+        if use_dynamic_web_tools and (web_search_enabled or web_fetch_enabled):
+            print(f"Using dynamic-filtering web tools for {model_name}")
 
         system_message, messages = pop_system_message(body["messages"])
 
@@ -662,7 +770,15 @@ class Pipe:
         # Add web search tool if supported by model and enabled
         if self.supports_capability(model_name, "web_search") and web_search_enabled:
             tools.append(
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+                {
+                    "type": (
+                        "web_search_20260318"
+                        if use_dynamic_web_tools
+                        else "web_search_20250305"
+                    ),
+                    "name": "web_search",
+                    "max_uses": 5,
+                }
             )
 
         # Add code execution tool if supported by model and enabled
@@ -676,7 +792,11 @@ class Pipe:
         if self.supports_capability(model_name, "web_fetch") and web_fetch_enabled:
             tools.append(
                 {
-                    "type": "web_fetch_20250910",
+                    "type": (
+                        "web_fetch_20260318"
+                        if use_dynamic_web_tools
+                        else "web_fetch_20250910"
+                    ),
                     "name": "web_fetch",
                     "max_uses": 5,
                     "citations": {"enabled": True},
@@ -703,18 +823,16 @@ class Pipe:
 
         # Add extended thinking capability for supported models
         if self.supports_capability(model_name, "thinking") and thinking_enabled:
-            # Adaptive thinking models. On Opus 4.8/4.7 this is the ONLY thinking
-            # mode (manual budget_tokens returns 400). display="summarized" is
-            # required on Opus 4.8/4.7, whose default is "omitted" (empty thinking
-            # text); on 4.6/Sonnet 4.6 it is the existing default and harmless.
-            if model_name in (
-                "claude-opus-4-8",
-                "claude-opus-4-6",
-                "claude-sonnet-4-6",
-            ):
+            # Adaptive thinking models. On Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
+            # this is the ONLY thinking mode (manual budget_tokens returns 400).
+            # display="summarized" is required on those models, whose default is
+            # "omitted" (empty thinking text); on Opus 4.6 / Sonnet 4.6 it is the
+            # existing default and harmless.
+            if model_name in self.ADAPTIVE_THINKING_MODELS:
                 # Thinking display. Default "summarized" so the model's reasoning is
-                # visible in <think> blocks. Opus 4.8/4.7 default to "omitted" (empty
-                # thinking text) at the API level, so we set this explicitly.
+                # visible in <think> blocks. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
+                # default to "omitted" (empty thinking text) at the API level, so we
+                # set this explicitly.
                 display = (
                     user_valves.THINKING_DISPLAY
                     if user_valves and getattr(user_valves, "THINKING_DISPLAY", "")
@@ -746,12 +864,10 @@ class Pipe:
                         print(
                             f"Invalid effort '{effort}'; valid values: {sorted(valid_efforts)}. Ignoring."
                         )
-                    elif effort == "xhigh" and model_name not in (
-                        "claude-opus-4-8",
-                        "claude-opus-4-7",
-                    ):
+                    elif effort == "xhigh" and model_name in self.NO_XHIGH_MODELS:
                         print(
-                            f"Effort 'xhigh' is only supported on Opus 4.8/4.7; ignoring for {model_name}."
+                            f"Effort 'xhigh' is not supported on {model_name} "
+                            "(Opus 4.6 / Sonnet 4.6); ignoring."
                         )
                     else:
                         extra_body = params.setdefault("extra_body", {})
@@ -804,6 +920,22 @@ class Pipe:
                                 f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
                             )
                             body["stream"] = True
+        elif (
+            model_name in self.THINKING_ON_BY_DEFAULT_MODELS
+            and model_name not in self.THINKING_ALWAYS_ON_MODELS
+        ):
+            # Opus 5 thinks when `thinking` is omitted, so ENABLE_THINKING=False
+            # has to be sent explicitly. The API only accepts a disabled config at
+            # effort "high" or below, and effort is only sent alongside adaptive
+            # thinking above, so the API default (high) applies here.
+            params["thinking"] = {"type": "disabled"}
+            print(f"Disabling thinking for {model_name} (thinking is on by default)")
+        elif model_name in self.THINKING_ALWAYS_ON_MODELS:
+            # Fable 5 rejects `{"type": "disabled"}` at any effort — thinking is
+            # always on and the parameter must be omitted entirely.
+            print(
+                f"Thinking cannot be disabled on {model_name}; leaving it on (API default)."
+            )
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -867,6 +999,7 @@ class Pipe:
 
     async def stream_response_sdk(self, params):
         try:
+            self.show_code_execution = self._code_execution_declared(params)
             with self.client.messages.stream(**params) as stream:
                 # For extended thinking: handle thinking blocks in the stream
                 self.is_thinking = False
@@ -893,6 +1026,10 @@ class Pipe:
                 # Track when we're in tool usage to add proper spacing after tools
                 in_tool_usage = False
 
+                # Safety-classifier refusal tracking (stop_reason "refusal")
+                refused = False
+                refusal_stop_details = None
+
                 current_text_block_index = None
                 current_citations = []
 
@@ -912,8 +1049,18 @@ class Pipe:
                                     getattr(usage, "cache_read_input_tokens", 0) or 0
                                 )
 
-                        elif event.type == "message_delta" and hasattr(event, "usage"):
-                            output_tokens = event.usage.output_tokens
+                        elif event.type == "message_delta":
+                            if hasattr(event, "usage"):
+                                output_tokens = event.usage.output_tokens
+                            # A safety classifier can decline the request
+                            # mid-stream (or before any output) — the stream
+                            # ends normally, so surface it explicitly.
+                            delta = getattr(event, "delta", None)
+                            if getattr(delta, "stop_reason", None) == "refusal":
+                                refused = True
+                                refusal_stop_details = getattr(
+                                    delta, "stop_details", None
+                                )
 
                         # Handle thinking content block start
                         if (
@@ -981,39 +1128,38 @@ class Pipe:
                             and hasattr(event, "content_block")
                             and event.content_block.type == "server_tool_use"
                         ):
-                            in_tool_usage = True
+                            tool_name = getattr(event.content_block, "name", None)
+                            # Suppressed blocks render nothing, so they also
+                            # don't need the trailing spacing newline emitted
+                            # when a visible tool block ends.
+                            is_code_exec_block = tool_name in (
+                                "bash_code_execution",
+                                "text_editor_code_execution",
+                            )
+                            in_tool_usage = (
+                                self.show_code_execution or not is_code_exec_block
+                            )
                             # Handle code execution specifically
-                            if (
-                                hasattr(event.content_block, "name")
-                                and event.content_block.name == "bash_code_execution"
-                            ):
+                            if tool_name == "bash_code_execution":
                                 self.is_code_execution = True
                                 self.code_execution_block_index = getattr(
                                     event, "index", None
                                 )
-                                yield "\n**Bash Command:**\n```bash\n"
+                                if self.show_code_execution:
+                                    yield "\n**Bash Command:**\n```bash\n"
 
-                            elif (
-                                hasattr(event.content_block, "name")
-                                and event.content_block.name
-                                == "text_editor_code_execution"
-                            ):
+                            elif tool_name == "text_editor_code_execution":
                                 self.is_code_execution = True
                                 self.code_execution_block_index = getattr(
                                     event, "index", None
                                 )
-                                yield "\n**File Operation:**\n```\n"
+                                if self.show_code_execution:
+                                    yield "\n**File Operation:**\n```\n"
 
-                            elif (
-                                hasattr(event.content_block, "name")
-                                and event.content_block.name == "web_fetch"
-                            ):
+                            elif tool_name == "web_fetch":
                                 yield "\n**Using web fetch tool...**\n"
 
-                            elif (
-                                hasattr(event.content_block, "name")
-                                and event.content_block.name == "web_search"
-                            ):
+                            elif tool_name == "web_search":
                                 web_search_count += 1
                                 yield "\n**Searching the web...**\n"
 
@@ -1040,7 +1186,8 @@ class Pipe:
                         ):
                             self.is_code_execution = False
                             self.code_execution_block_index = None
-                            yield "\n```\n"
+                            if self.show_code_execution:
+                                yield "\n```\n"
 
                         # Handle code execution results
                         elif (
@@ -1053,38 +1200,44 @@ class Pipe:
                                 == "text_editor_code_execution_tool_result"
                             )
                         ):
-                            yield "\n**Output:**\n```\n"
-                            if hasattr(event.content_block, "content"):
-                                content = event.content_block.content
+                            if self.show_code_execution:
+                                yield "\n**Output:**\n```\n"
+                                if hasattr(event.content_block, "content"):
+                                    content = event.content_block.content
 
-                                # Handle Bash results
-                                if (
-                                    event.content_block.type
-                                    == "bash_code_execution_tool_result"
-                                ):
-                                    if hasattr(content, "stdout") and content.stdout:
-                                        yield content.stdout
-                                    if hasattr(content, "stderr") and content.stderr:
-                                        yield f"\n**Error:**\n{content.stderr}"
+                                    # Handle Bash results
+                                    if (
+                                        event.content_block.type
+                                        == "bash_code_execution_tool_result"
+                                    ):
+                                        stdout = getattr(content, "stdout", None)
+                                        stderr = getattr(content, "stderr", None)
+                                        if stdout:
+                                            yield stdout
+                                        if stderr:
+                                            yield f"\n**Error:**\n{stderr}"
 
-                                # Handle Text Editor results
-                                elif (
-                                    event.content_block.type
-                                    == "text_editor_code_execution_tool_result"
-                                ):
-                                    if hasattr(content, "content") and content.content:
-                                        yield content.content
-                                    if hasattr(content, "lines") and content.lines:
-                                        # Diff format
-                                        yield "\n".join(content.lines)
-                                    if hasattr(content, "is_file_update"):
-                                        yield (
-                                            "File created."
-                                            if not content.is_file_update
-                                            else "File updated."
-                                        )
+                                    # Handle Text Editor results
+                                    elif (
+                                        event.content_block.type
+                                        == "text_editor_code_execution_tool_result"
+                                    ):
+                                        if (
+                                            hasattr(content, "content")
+                                            and content.content
+                                        ):
+                                            yield content.content
+                                        if hasattr(content, "lines") and content.lines:
+                                            # Diff format
+                                            yield "\n".join(content.lines)
+                                        if hasattr(content, "is_file_update"):
+                                            yield (
+                                                "File created."
+                                                if not content.is_file_update
+                                                else "File updated."
+                                            )
 
-                            yield "\n```\n\n"
+                                yield "\n```\n\n"
 
                         # Handle web fetch results
                         elif (
@@ -1249,6 +1402,13 @@ class Pipe:
                         if not self.is_thinking and not self.is_code_execution:
                             yield text
 
+                if refused:
+                    print(
+                        "Request declined by Anthropic's safety classifiers "
+                        f"(model: {params['model']})."
+                    )
+                    yield self._refusal_notice(refusal_stop_details)
+
             # Calculate and emit usage. With prompt caching, input_tokens only
             # counts tokens after the cache breakpoint — the cached prefix is
             # reported separately in the cache_* fields, so sum all three for
@@ -1300,7 +1460,20 @@ class Pipe:
     async def non_stream_response_sdk(self, params):
         try:
             start_time = time.time()
+            self.show_code_execution = self._code_execution_declared(params)
             response = self.client.messages.create(**params)
+
+            # A safety classifier may decline the request: HTTP 200 with
+            # stop_reason "refusal" and empty (or partial) content.
+            refusal_notice = ""
+            if getattr(response, "stop_reason", None) == "refusal":
+                refusal_notice = self._refusal_notice(
+                    getattr(response, "stop_details", None)
+                )
+                print(
+                    "Request declined by Anthropic's safety classifiers "
+                    f"(model: {params['model']})."
+                )
 
             # Handle different content types in the response
             if hasattr(response, "content") and response.content:
@@ -1441,7 +1614,8 @@ class Pipe:
                     elif content_block.type == "server_tool_use":
                         if content_block.name == "bash_code_execution":
                             if (
-                                hasattr(content_block, "input")
+                                self.show_code_execution
+                                and hasattr(content_block, "input")
                                 and "command" in content_block.input
                             ):
                                 command = content_block.input["command"]
@@ -1449,7 +1623,10 @@ class Pipe:
                                     f"\n**Bash Command:**\n```bash\n{command}\n```\n"
                                 )
 
-                        elif content_block.name == "text_editor_code_execution":
+                        elif (
+                            content_block.name == "text_editor_code_execution"
+                            and self.show_code_execution
+                        ):
                             if hasattr(content_block, "input"):
                                 cmd = content_block.input.get("command", "")
                                 path = content_block.input.get("path", "")
@@ -1473,7 +1650,10 @@ class Pipe:
                             result_parts.append(f"\n**Web Search:**\n")
 
                     # Handle code execution results
-                    elif content_block.type == "bash_code_execution_tool_result":
+                    elif (
+                        content_block.type == "bash_code_execution_tool_result"
+                        and self.show_code_execution
+                    ):
                         if hasattr(content_block, "content"):
                             content = content_block.content
                             result_parts.append("\n**Output:**\n```\n")
@@ -1483,7 +1663,10 @@ class Pipe:
                                 result_parts.append(f"\n**Error:**\n{content.stderr}")
                             result_parts.append("\n```\n")
 
-                    elif content_block.type == "text_editor_code_execution_tool_result":
+                    elif (
+                        content_block.type == "text_editor_code_execution_tool_result"
+                        and self.show_code_execution
+                    ):
                         if hasattr(content_block, "content"):
                             content = content_block.content
                             result_parts.append("\n**Output:**\n```\n")
@@ -1562,9 +1745,12 @@ class Pipe:
 
                     await self.event_emitter.emit_usage(usage_data)
 
+                if refusal_notice:
+                    result_parts.append(refusal_notice)
+
                 return "".join(result_parts)
 
-            return ""
+            return refusal_notice
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)

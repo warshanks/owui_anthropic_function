@@ -402,9 +402,9 @@ class Pipe:
         return [
             {"id": "claude-opus-5", "name": "claude-opus-5"},
             {"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
-            {"id": "claude-fable-5", "name": "claude-fable-5"},
+            # {"id": "claude-fable-5", "name": "claude-fable-5"},
             {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
-            {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
+            # {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
             # {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
             # {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
             {"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},

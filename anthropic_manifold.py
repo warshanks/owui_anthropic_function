@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.16.0
+version: 0.17.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -16,6 +16,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
 - Safety-classifier refusals surfaced instead of returning an empty response
+- Preserved-thinking prefix binding handled on Claude Fable 5.1
 """
 
 import os
@@ -218,10 +219,12 @@ class Pipe:
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
+                "claude-fable-5-1",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
+                "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -237,10 +240,12 @@ class Pipe:
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
+                "claude-fable-5-1",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
+                "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5-20250929",
@@ -254,10 +259,12 @@ class Pipe:
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-fable-5-1",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
+                "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -276,19 +283,23 @@ class Pipe:
             # search-heavy turns. Available on Claude 4.6 and later models.
             # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "dynamic_web_tools": {
+                "claude-fable-5-1",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
+                "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-fable-5-1",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
+                "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
@@ -306,10 +317,12 @@ class Pipe:
         # thinking (`{"type": "enabled", "budget_tokens": N}`) is rejected with
         # a 400 on all of these, so they must never take the budget path.
         self.ADAPTIVE_THINKING_MODELS = {
+            "claude-fable-5-1",
             "claude-opus-5",
             "claude-fable-5",
             "claude-sonnet-5",
             "claude-opus-4-8",
+            "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-sonnet-4-6",
         }
@@ -321,20 +334,38 @@ class Pipe:
         # Models that think when the `thinking` parameter is omitted, so
         # honoring ENABLE_THINKING=False requires sending an explicit
         # `{"type": "disabled"}` config rather than leaving it out.
-        self.THINKING_ON_BY_DEFAULT_MODELS = {"claude-opus-5", "claude-fable-5"}
+        self.THINKING_ON_BY_DEFAULT_MODELS = {
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-fable-5",
+        }
 
         # Models that reject `{"type": "disabled"}` outright — thinking is
-        # always on and the parameter has to be omitted entirely.
-        self.THINKING_ALWAYS_ON_MODELS = {"claude-fable-5"}
+        # always on and the parameter has to be omitted (or sent as
+        # `{"type": "adaptive"}`).
+        self.THINKING_ALWAYS_ON_MODELS = {"claude-fable-5-1", "claude-fable-5"}
+
+        # Models that bind each thinking block to the conversation prefix that
+        # produced it. Editing anything before a thinking block (an earlier
+        # message, the system prompt, the tool list) invalidates every later
+        # block, and replaying one is rejected with a 400 ("The block is bound
+        # to a different conversation") on accounts created on or after
+        # 2026-08-31. Open WebUI lets users edit and regenerate earlier turns,
+        # so the pipe opts into dropping invalidated blocks instead.
+        self.PREFIX_BINDING_MODELS = {"claude-fable-5-1"}
 
         # Pricing per million tokens (Input / Output)
+        # NOTE: _get_pricing matches by substring, so longer model IDs must
+        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1".
         self.PRICING = {
             # Claude 5 family
+            "claude-fable-5-1": {"input": 10.00, "output": 50.00},
             "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
-            "claude-sonnet-5": {"input": 3.00, "output": 15.00},
-            # Claude 4.8 family
+            "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+            # Claude 4.8 / 4.7 family
             "claude-opus-4-8": {"input": 5.00, "output": 25.00},
+            "claude-opus-4-7": {"input": 5.00, "output": 25.00},
             # Claude 4.6 family
             "claude-opus-4-6": {"input": 5.00, "output": 25.00},
             "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
@@ -354,7 +385,13 @@ class Pipe:
             "claude-3-haiku": {"input": 0.25, "output": 1.25},
         }
 
-        # Cost per web search request
+        # Cache reads cost 0.10x the base input price on every model except
+        # Claude Fable 5.1, where they cost 0.025x ($0.25 per MTok against a
+        # $10 input price).
+        self.CACHE_READ_MULTIPLIER = 0.10
+        self.REDUCED_CACHE_READ_MODELS = {"claude-fable-5-1"}
+
+        # Cost per web search request ($10 per 1,000 searches)
         self.WEB_SEARCH_COST = 0.01
 
         # Cache write premium over base input price (1.25x for 5m TTL,
@@ -364,6 +401,7 @@ class Pipe:
     def get_anthropic_models(self):
         return [
             {"id": "claude-opus-5", "name": "claude-opus-5"},
+            {"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
             {"id": "claude-fable-5", "name": "claude-fable-5"},
             {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
@@ -398,6 +436,13 @@ class Pipe:
         print(f"Warning: No pricing found for model {model_name}")
         return {"input": 0.0, "output": 0.0}
 
+    def _cache_read_multiplier(self, model_name: str) -> float:
+        """Cache-hit price as a fraction of the base input price."""
+        for key in self.REDUCED_CACHE_READ_MODELS:
+            if key in model_name:
+                return 0.025
+        return self.CACHE_READ_MULTIPLIER
+
     def _calculate_cost(
         self,
         input_tokens: int,
@@ -415,7 +460,11 @@ class Pipe:
             * pricing["input"]
             * self.cache_write_multiplier
         )
-        cache_read_cost = (cache_read_tokens / 1_000_000) * pricing["input"] * 0.10
+        cache_read_cost = (
+            (cache_read_tokens / 1_000_000)
+            * pricing["input"]
+            * self._cache_read_multiplier(model_name)
+        )
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         web_search_cost = web_search_count * self.WEB_SEARCH_COST
         return round(
@@ -494,16 +543,14 @@ class Pipe:
                 "source": {"type": "url", "url": url},
             }
 
-    def init_client(
-        self,
-        user_valves=None,
-        model_name=None,
-        code_execution_enabled=True,
-        web_fetch_enabled=False,
-        event_emitter=None,
-        dynamic_web_tools=False,
-    ):
-        """Initialize Anthropic client with appropriate API key and beta headers."""
+    def init_client(self, user_valves=None, event_emitter=None):
+        """Initialize the Anthropic client with the appropriate API key.
+
+        Beta headers are not set here. Which betas a request needs depends on
+        the model and the tools enabled for that request, so they are sent per
+        request via `extra_headers` (see `_beta_headers`) rather than baked
+        into the client's default headers.
+        """
         if event_emitter:
             self.event_emitter = EventEmitter(event_emitter)
 
@@ -522,30 +569,36 @@ class Pipe:
             if not api_key and self.valves.REQUIRE_USER_API_KEY:
                 raise ValueError("API key is required but not provided")
 
-            # Determine required beta headers based on model capabilities
-            beta_headers = []
+            self.client = anthropic.Anthropic(api_key=api_key)
 
-            if model_name:
-                if code_execution_enabled:
-                    # Check if the model supports code execution
-                    if self.supports_capability(model_name, "code_execution"):
-                        beta_headers.append("code-execution-2025-08-25")
+    def _beta_headers(
+        self,
+        model_name,
+        web_fetch_enabled=False,
+        dynamic_web_tools=False,
+    ) -> List[str]:
+        """Beta opt-ins this request needs, as `anthropic-beta` values.
 
-                if web_fetch_enabled and not dynamic_web_tools:
-                    # Only the basic web_fetch_20250910 version needs this beta
-                    # header; the dynamic-filtering versions are GA.
-                    if self.supports_capability(model_name, "web_fetch"):
-                        beta_headers.append("web-fetch-2025-09-10")
+        Code execution no longer needs one: every current tool version
+        (`code_execution_20250825` through `code_execution_20260521`) is GA.
+        """
+        betas = []
 
-            # Create default headers
-            default_headers = {}
-            if beta_headers:
-                default_headers["anthropic-beta"] = ",".join(beta_headers)
+        if model_name in self.PREFIX_BINDING_MODELS:
+            # Lets the API drop thinking blocks invalidated by an edited
+            # history instead of rejecting the whole request.
+            betas.append("thinking-binding-controls-2026-08-01")
 
-            self.client = anthropic.Anthropic(
-                api_key=api_key,
-                default_headers=default_headers if default_headers else None,
-            )
+        if (
+            web_fetch_enabled
+            and not dynamic_web_tools
+            and self.supports_capability(model_name, "web_fetch")
+        ):
+            # Only the basic web_fetch_20250910 version needs this beta
+            # header; the dynamic-filtering versions are GA.
+            betas.append("web-fetch-2025-09-10")
+
+        return betas
 
     async def pipe(
         self,
@@ -625,14 +678,7 @@ class Pipe:
             and not code_execution_requested
         )
 
-        self.init_client(
-            user_valves,
-            model_name,
-            code_execution_enabled,
-            web_fetch_enabled,
-            __event_emitter__,
-            dynamic_web_tools=use_dynamic_web_tools,
-        )
+        self.init_client(user_valves, __event_emitter__)
 
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
@@ -786,7 +832,11 @@ class Pipe:
             self.supports_capability(model_name, "code_execution")
             and code_execution_enabled
         ):
-            tools.append({"type": "code_execution_20250825", "name": "code_execution"})
+            # code_execution_20260521: same runtime as 20260120, and the
+            # version the current dynamic-filtering web tools call into.
+            # Every supported model accepts it and none of the current
+            # versions needs a beta header.
+            tools.append({"type": "code_execution_20260521", "name": "code_execution"})
 
         # Add web fetch tool if supported by model and enabled
         if self.supports_capability(model_name, "web_fetch") and web_fetch_enabled:
@@ -931,11 +981,24 @@ class Pipe:
             params["thinking"] = {"type": "disabled"}
             print(f"Disabling thinking for {model_name} (thinking is on by default)")
         elif model_name in self.THINKING_ALWAYS_ON_MODELS:
-            # Fable 5 rejects `{"type": "disabled"}` at any effort — thinking is
-            # always on and the parameter must be omitted entirely.
+            # Fable 5 / Fable 5.1 reject `{"type": "disabled"}` at any effort —
+            # thinking is always on and the parameter must be omitted.
             print(
                 f"Thinking cannot be disabled on {model_name}; leaving it on (API default)."
             )
+
+        # Preserved thinking: on models that bind thinking blocks to the
+        # conversation prefix, replaying a block after the history changed is a
+        # 400. Open WebUI rebuilds the message list every turn and lets users
+        # edit, branch and regenerate earlier messages, so ask the API to drop
+        # invalidated blocks and answer anyway. `{"type": "adaptive"}` is the
+        # always-on default on these models, so adding it when thinking is off
+        # in the valves changes nothing except giving block_binding a home.
+        if model_name in self.PREFIX_BINDING_MODELS:
+            thinking_params = params.setdefault("thinking", {"type": "adaptive"})
+            thinking_params["block_binding"] = {
+                "prefix_mismatch_behavior": "drop_block"
+            }
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -974,6 +1037,14 @@ class Pipe:
 
         if tools:
             params["tools"] = tools
+
+        beta_headers = self._beta_headers(
+            model_name,
+            web_fetch_enabled=web_fetch_enabled,
+            dynamic_web_tools=use_dynamic_web_tools,
+        )
+        if beta_headers:
+            params["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
 
         try:
             if body.get("stream", False):

@@ -14,11 +14,17 @@ The following table shows pricing for all Claude models across different usage t
 
 | Model             | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
 |-------------------|-------------------|-----------------|-----------------|----------------------|---------------|
+| Claude Fable 5.1  | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $0.25 / MTok<sup>1</sup> | $50 / MTok    |
+| Claude Fable 5    | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $1 / MTok    | $50 / MTok    |
+| Claude Opus 5     | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
+| Claude Sonnet 5   | $2 / MTok         | $2.50 / MTok    | $4 / MTok       | $0.20 / MTok | $10 / MTok    |
 | Claude Opus 4.8   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
+| Claude Opus 4.7   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.6   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.5   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.1   | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
 | Claude Opus 4     | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
+| Claude Sonnet 4.6   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 4.5   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 4   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 3.7 ([deprecated](/docs/en/about-claude/model-deprecations)) | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
@@ -34,6 +40,8 @@ The table above reflects the following pricing multipliers for prompt caching:
 - 5-minute cache write tokens are 1.25 times the base input tokens price
 - 1-hour cache write tokens are 2 times the base input tokens price
 - Cache read tokens are 0.1 times the base input tokens price
+
+<sup>1</sup> Cache hits and refreshes on Claude Fable 5.1 (and Claude Mythos 5.1) are priced at 0.025 times the base input price. All other models use the standard 0.1x multiplier.
 </Note>
 
 ## Third-party platform pricing
@@ -67,11 +75,17 @@ The Batch API allows asynchronous processing of large volumes of requests with a
 
 | Model             | Batch input      | Batch output    |
 |-------------------|------------------|-----------------|
+| Claude Fable 5.1    | $5 / MTok        | $25 / MTok      |
+| Claude Fable 5      | $5 / MTok        | $25 / MTok      |
+| Claude Opus 5       | $2.50 / MTok     | $12.50 / MTok   |
+| Claude Sonnet 5     | $1 / MTok        | $5 / MTok       |
 | Claude Opus 4.8     | $2.50 / MTok     | $12.50 / MTok   |
+| Claude Opus 4.7     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.6     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.5     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.1     | $7.50 / MTok     | $37.50 / MTok   |
 | Claude Opus 4     | $7.50 / MTok     | $37.50 / MTok   |
+| Claude Sonnet 4.6   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 4.5   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 4   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 3.7 ([deprecated](/docs/en/about-claude/model-deprecations)) | $1.50 / MTok     | $7.50 / MTok    |
@@ -179,7 +193,9 @@ See [tool use pricing](#tool-use-pricing) for complete pricing details.
 
 #### Code execution tool
 
-Code execution tool usage is tracked separately from token usage. Execution time has a minimum of 5 minutes.
+Code execution is free when used with web search or web fetch: when `web_search_20260209` (or later) or `web_fetch_20260209` (or later) is in the request, code execution calls cost nothing beyond standard token costs.
+
+Used on its own, code execution tool usage is tracked separately from token usage. Execution time has a minimum of 5 minutes.
 If files are included in the request, execution time is billed even if the tool is not used due to files being preloaded onto the container.
 
 Each organization receives 1,550 free hours of usage with the code execution tool per month. Additional usage beyond the first 1,550 hours is billed at $0.05 per hour, per container.

@@ -84,13 +84,13 @@ The pipe now picks web tool versions per model. On Opus 5 (and every other Claud
 
 - **Web search** — `web_search_20260318` (was `web_search_20250305`)
 - **Web fetch** — `web_fetch_20260318` (was `web_fetch_20250910`)
-- **Code execution** — `code_execution_20250825` (unchanged)
+- **Code execution** — `code_execution_20260521` (was `code_execution_20250825`; bumped in v0.17.0)
 
 With dynamic filtering, Claude writes and runs code that filters search results and fetched pages *before* they reach the context window, which cuts input tokens on search-heavy turns. All tool versions are GA — no beta header. The legacy `web-fetch-2025-09-10` beta header is now sent only when the basic `web_fetch_20250910` version is used.
 
 Two behaviors follow from how dynamic filtering works:
 
-- **It runs inside a code execution sandbox the API provisions itself**, so the code execution tool must not also be declared in the same request. When the user turns on Open WebUI's code interpreter, their code execution takes precedence and the request falls back to the basic web tool versions. (The pipe declares `code_execution_20250825`, which predates the `code_execution_20260120` caller that dynamic filtering calls into, so mixing them is not just noisy — it may be rejected.)
+- **It runs inside a code execution sandbox the API provisions itself**, so the code execution tool must not also be declared in the same request. When the user turns on Open WebUI's code interpreter, their code execution takes precedence and the request falls back to the basic web tool versions. (Since v0.17.0 the pipe declares `code_execution_20260521`, the same runtime dynamic filtering calls into, but a second explicitly declared execution environment still confuses the model, so the fallback stands.)
 - **The filtering code is not rendered into the chat.** Dynamic filtering emits bash / file-operation blocks that would otherwise show up as "Bash Command" and "Output" sections even though the user only asked for a web search. Code execution blocks are now rendered only when the request actually declares the code execution tool.
 
 Models older than Claude 4.6 (Haiku 4.5, Opus 4.5 and earlier) keep `web_search_20250305` / `web_fetch_20250910`; dynamic filtering requires Claude 4.6 or later.

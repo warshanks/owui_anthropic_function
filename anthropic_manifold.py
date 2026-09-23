@@ -3,14 +3,18 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.18.0
+version: 0.19.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
+- Open WebUI tools (workspace tools, MCP servers, tool servers and builtins)
+  through native function calling
 - Web search capabilities (dynamic result filtering on Claude 4.6+ models)
 - Web fetch capabilities (dynamic content filtering on Claude 4.6+ models)
 - Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
+- Thinking shown in Open WebUI's Thoughts section, with signatures carried
+  between turns out of band instead of in the reply text
 - Automatic prompt caching for multi-turn conversations (large input cost savings)
 - Image processing and analysis
 - Centralized model capability management
@@ -19,6 +23,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Preserved-thinking prefix binding handled on Claude Fable 5.1 and Claude Opus 5.5
 """
 
+import json
 import os
 import re
 import time
@@ -153,9 +158,10 @@ class Pipe:
             default="summarized",
             description=(
                 "How adaptive-thinking reasoning is returned: 'summarized' shows the "
-                "model's reasoning in <think> blocks; 'omitted' hides the reasoning "
-                "text for lower streaming latency (the <think> block still appears, "
-                "just empty). Defaults to 'summarized' so it's clear the model thought. "
+                "model's reasoning in Open WebUI's Thoughts section; 'omitted' hides "
+                "the reasoning text for lower streaming latency (the Thoughts section "
+                "still appears, with a short note in place of the reasoning). "
+                "Defaults to 'summarized' so it's clear the model thought. "
                 "Note: Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8 "
                 "default to 'omitted' at the API level; this valve overrides that. You are billed for thinking "
                 "tokens either way."
@@ -209,7 +215,6 @@ class Pipe:
         self.MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB per image
         self.client = None
         self.is_thinking = False
-        self.thinking_start_time = None
         self.is_code_execution = False
         self.code_execution_block_index = None
         # Whether code execution blocks are rendered into the chat (only when
@@ -367,6 +372,24 @@ class Pipe:
         # so the pipe opts into dropping invalidated blocks instead.
         self.PREFIX_BINDING_MODELS = {"claude-fable-5-1", "claude-opus-5-5"}
 
+        # Open WebUI builtin tools that duplicate an Anthropic server tool.
+        # With native function calling, Open WebUI offers search_web and
+        # fetch_url when web search is toggled on and execute_code for the code
+        # interpreter; each is dropped while the pipe declares the Anthropic
+        # version, so Claude isn't handed two tools for the same job.
+        self.OWUI_TOOLS_REPLACED_BY = {
+            "web_search": {"search_web"},
+            "web_fetch": {"fetch_url"},
+            "code_execution": {"execute_code"},
+        }
+
+        # Thoughts-section text for a thinking block with no readable text
+        # (display "omitted", or no summary returned). Open WebUI only opens a
+        # Thoughts item for reasoning text, and the block's signature has to
+        # attach to one to be replayed on the next turn.
+        self.THINKING_HIDDEN_NOTE = "*Reasoning hidden.*"
+        self.REDACTED_THINKING_NOTE = "*[Some reasoning has been encrypted for safety]*"
+
         # Pricing per million tokens (Input / Output)
         # NOTE: _get_pricing matches by substring, so longer model IDs must
         # come first — "claude-fable-5" is a prefix of "claude-fable-5-1" and
@@ -419,14 +442,14 @@ class Pipe:
     def get_anthropic_models(self):
         return [
             {"id": "claude-opus-5-5", "name": "claude-opus-5-5"},
-            {"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
-            {"id": "claude-opus-5", "name": "claude-opus-5"},
+            #{"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
+            #{"id": "claude-opus-5", "name": "claude-opus-5"},
             # {"id": "claude-fable-5", "name": "claude-fable-5"},
-            {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
+            #{"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             # {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
             # {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
             # {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
-            {"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
+            #{"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
         ]
 
     def pipes(self) -> List[dict]:
@@ -524,6 +547,236 @@ class Pipe:
         if explanation:
             notice += f"\n*{explanation}*\n"
         return notice
+
+    def _delta(self, **fields) -> dict:
+        """An OpenAI-format stream chunk, for output that isn't reply text.
+
+        Open WebUI reads `reasoning_content` into the Thoughts section,
+        `reasoning_details` onto the Thoughts item, and `tool_calls` into its
+        native tool-call loop. Plain strings yielded from the stream are still
+        treated as reply text.
+        """
+        return {"choices": [{"index": 0, "delta": fields, "finish_reason": None}]}
+
+    def _thinking_detail(self, thinking: str, signature: str) -> dict:
+        """A thinking block as an Open WebUI `reasoning_details` entry.
+
+        Open WebUI stores these on the reply's Thoughts item and hands them
+        back on the assistant message in later requests to the same model, so
+        thinking blocks keep their signatures between turns and through tool
+        calls without being written into the reply text. The shape is
+        OpenRouter's, which Open WebUI already understands.
+        """
+        return {
+            "type": "reasoning.text",
+            "text": thinking,
+            "signature": signature,
+            "format": "anthropic-claude-v1",
+        }
+
+    def _redacted_thinking_detail(self, data: str) -> dict:
+        # No "format" key: Open WebUI drops anthropic-claude-v1 entries that
+        # lack a signature, and a redacted block carries `data` instead.
+        return {"type": "reasoning.encrypted", "data": data}
+
+    def _thinking_blocks_from_details(self, details) -> list:
+        """Rebuild thinking blocks from the `reasoning_details` Open WebUI replays."""
+        blocks = []
+        for detail in details if isinstance(details, list) else [details]:
+            if not isinstance(detail, dict):
+                continue
+            if detail.get("type") == "reasoning.text" and detail.get("signature"):
+                blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": detail.get("text") or "",
+                        "signature": detail["signature"],
+                    }
+                )
+            elif detail.get("type") == "reasoning.encrypted" and detail.get("data"):
+                blocks.append({"type": "redacted_thinking", "data": detail["data"]})
+        return blocks
+
+    def _split_legacy_thinking(self, text: str):
+        """Pull a signed thinking block out of reply text from older versions.
+
+        Before 0.19.0 the pipe wrote thinking into the reply as
+        <think>...</think> with the signature in a comment, in one of these
+        formats (newest first):
+          <think>...</think>\\n[//]: # (signature: ...)
+          <think>...</think>\\n<!-- signature: ... -->
+          <think>...\\n<!-- signature: ... --></think>
+        Returns (thinking block or None, remaining text). Stray signature
+        comments are stripped either way so they don't reach the model as text.
+        """
+        block = None
+        match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+        if match:
+            inner, after = match.group(1), text[match.end() :]
+            signature_match = (
+                re.search(r"<!-- signature: (.*?) -->", inner)
+                or re.match(r"\s*<!-- signature: (.*?) -->", after)
+                or re.match(r"\s*\[//\]: # \(signature: (.*?)\)", after)
+            )
+            if signature_match:
+                block = {
+                    "type": "thinking",
+                    "thinking": re.sub(r"<!-- signature: .*? -->", "", inner).strip(),
+                    "signature": signature_match.group(1),
+                }
+            text = text[: match.start()] + after
+        text = re.sub(
+            r"\[//\]: # \(signature: [^)]*\)|<!-- signature: .*? -->", "", text
+        )
+        return block, text.strip()
+
+    def _content_blocks(self, content) -> list:
+        """Text and image blocks for a user message or a tool result."""
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}] if content else []
+
+        blocks = []
+        for item in content or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("text", "input_text"):
+                if item.get("text"):  # Only add non-empty text blocks
+                    blocks.append({"type": "text", "text": item["text"]})
+            elif item.get("type") == "image_url":
+                blocks.append(self.process_image(item))
+            elif item.get("type") == "input_image" and item.get("image_url"):
+                blocks.append(
+                    self.process_image({"image_url": {"url": item["image_url"]}})
+                )
+        return blocks
+
+    def _api_tool_name(self, name: str) -> str:
+        """Tool name the API accepts (`^[a-zA-Z0-9_-]{1,128}$`).
+
+        MCP tool names in particular can contain other characters. The mapping
+        is deterministic, so a tool call replayed from history converts to the
+        same name as the tool's current definition.
+        """
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", name or "")[:128]
+
+    def _tool_use_block(self, tool_call: dict) -> dict:
+        """An OpenAI-format tool call from Open WebUI as a `tool_use` block."""
+        function = tool_call.get("function") or {}
+        arguments = function.get("arguments") or "{}"
+        try:
+            tool_input = (
+                json.loads(arguments) if isinstance(arguments, str) else arguments
+            )
+        except ValueError:
+            tool_input = {}
+        return {
+            "type": "tool_use",
+            "id": tool_call.get("id", ""),
+            "name": self._api_tool_name(function.get("name", "")),
+            "input": tool_input if isinstance(tool_input, dict) else {},
+        }
+
+    def _convert_messages(self, messages: list) -> list:
+        """Convert Open WebUI's OpenAI-format history to Anthropic messages.
+
+        Assistant turns may carry `tool_calls` and `reasoning_details` (the
+        thinking blocks this pipe streamed, which Open WebUI replays for the
+        same model), and each tool result arrives as its own `role: "tool"`
+        message. Consecutive messages with the same role are merged, which
+        also keeps a turn's tool results together in one user message ahead
+        of any follow-up content Open WebUI adds (e.g. images from tools).
+        """
+        converted = []
+        total_image_size = 0
+
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            input_blocks = []  # text and images from the user or a tool
+
+            if role == "tool":
+                input_blocks = self._content_blocks(content)
+                tool_result = {
+                    "type": "tool_result",
+                    "tool_use_id": message.get("tool_call_id", ""),
+                }
+                if input_blocks:
+                    tool_result["content"] = input_blocks
+                role, blocks = "user", [tool_result]
+            elif role == "assistant":
+                blocks = self._thinking_blocks_from_details(
+                    message.get("reasoning_details")
+                )
+                if isinstance(content, list):
+                    content = "".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                legacy_thinking, text = self._split_legacy_thinking(content or "")
+                if legacy_thinking and not blocks:
+                    blocks.append(legacy_thinking)
+                if text:
+                    blocks.append({"type": "text", "text": text})
+                blocks.extend(
+                    self._tool_use_block(tool_call)
+                    for tool_call in message.get("tool_calls") or []
+                )
+            else:
+                blocks = input_blocks = self._content_blocks(content)
+
+            # Track total size for base64 images
+            for block in input_blocks:
+                if block["type"] == "image" and block["source"]["type"] == "base64":
+                    total_image_size += len(block["source"]["data"]) * 3 / 4
+                    if total_image_size > 100 * 1024 * 1024:  # 100MB total limit
+                        raise ValueError("Total size of images exceeds 100 MB limit")
+
+            if not blocks:
+                continue
+            if converted and converted[-1]["role"] == role:
+                converted[-1]["content"].extend(blocks)
+            else:
+                converted.append({"role": role, "content": blocks})
+
+        return converted
+
+    def _convert_owui_tools(self, body_tools, skip_names, reserved_names):
+        """Convert the tools Open WebUI offers the model to Anthropic tools.
+
+        With native function calling (Open WebUI's default), every tool
+        enabled for the chat — workspace tools, MCP servers, tool servers and
+        Open WebUI's builtins — arrives in `body["tools"]` in OpenAI format.
+        Open WebUI runs the calls itself when the stream ends in tool calls,
+        then calls the pipe again with the results. In legacy function calling
+        Open WebUI resolves tools before the pipe runs and sends none here.
+
+        Returns the Anthropic tool definitions and a map from each API tool
+        name back to the Open WebUI name (they differ only when the original
+        has characters the API rejects).
+        """
+        tools, owui_names = [], {}
+        for tool in body_tools or []:
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                continue
+            spec = tool.get("function") or {}
+            name = spec.get("name")
+            if not name or name in skip_names:
+                continue
+            api_name = self._api_tool_name(name)
+            if api_name in reserved_names or api_name in owui_names:
+                print(f"Skipping tool '{name}': its name is already in use.")
+                continue
+
+            input_schema = dict(spec.get("parameters") or {})
+            input_schema.setdefault("type", "object")
+            definition = {"name": api_name, "input_schema": input_schema}
+            if spec.get("description"):
+                definition["description"] = spec["description"]
+
+            tools.append(definition)
+            owui_names[api_name] = name
+        return tools, owui_names
 
     def process_image(self, image_data):
         """Process image data with size validation."""
@@ -642,38 +895,32 @@ class Pipe:
         # Reset client to ensure correct headers for the model
         self.client = None
 
-        features = body.get("features")
-        if not features:
-            features = body.get("metadata", {}).get("features")
+        # UI toggles. Open WebUI pops `features` off the request body before
+        # calling pipes and passes them in __metadata__; the body is only a
+        # fallback for older versions. They're read, never switched off here:
+        # Open WebUI has already acted on them by the time the pipe runs, and
+        # its tool-call loop calls the pipe again with the same metadata, so
+        # clearing a flag would drop that server tool partway through the loop.
+        metadata = __metadata__ or {}
+        features = (
+            metadata.get("features")
+            or body.get("features")
+            or body.get("metadata", {}).get("features")
+        )
+        if not isinstance(features, dict):
+            features = {}
 
         # Check if code execution is enabled in the UI
-        code_execution_enabled = False
-        if features and isinstance(features, dict):
-            code_execution_enabled = features.get("code_interpreter", False)
-            # Disable OWUI code execution
-            features["code_interpreter"] = False
+        code_execution_enabled = bool(features.get("code_interpreter"))
 
         # Check if web search is enabled in the UI
-        web_search_enabled = False
-        if features and isinstance(features, dict):
-            web_search_enabled = features.get("web_search", False)
-            # Disable OWUI web search
-            features["web_search"] = False
+        web_search_enabled = bool(features.get("web_search"))
 
-        # Check if web fetch is enabled via url_context toggle
-        web_fetch_enabled = False
-
-        # Check using __metadata__ if available (preferred method for toggle filters)
-        if __metadata__:
-            user_toggled_ids = __metadata__.get("filter_ids", [])
-            if "gemini_url_context_toggle" in user_toggled_ids:
-                web_fetch_enabled = True
-
-        # Fallback to checking features dict if not enabled via metadata
-        if not web_fetch_enabled:
-            if features and isinstance(features, dict):
-                # The filter sets "url_context" to True
-                web_fetch_enabled = features.get("url_context", False)
+        # Check if web fetch is enabled via the url_context toggle filter, which
+        # shows up in filter_ids and sets "url_context" in features
+        web_fetch_enabled = "gemini_url_context_toggle" in (
+            metadata.get("filter_ids") or []
+        ) or bool(features.get("url_context"))
 
         # Check if thinking is enabled in valves
         thinking_enabled = (
@@ -723,113 +970,9 @@ class Pipe:
 
         system_message, messages = pop_system_message(body["messages"])
 
-        processed_messages = []
-        total_image_size = 0
+        processed_messages = self._convert_messages(messages)
 
-        for message in messages:
-            processed_content = []
-            if isinstance(message.get("content"), list):
-                for item in message["content"]:
-                    if item["type"] == "text":
-                        if item["text"]:  # Only add non-empty text blocks
-                            processed_content.append(
-                                {"type": "text", "text": item["text"]}
-                            )
-                    elif item["type"] == "image_url":
-                        processed_image = self.process_image(item)
-                        processed_content.append(processed_image)
-
-                        # Track total size for base64 images
-                        if processed_image["source"]["type"] == "base64":
-                            image_size = len(processed_image["source"]["data"]) * 3 / 4
-                            total_image_size += image_size
-                            if (
-                                total_image_size > 100 * 1024 * 1024
-                            ):  # 100MB total limit
-                                raise ValueError(
-                                    "Total size of images exceeds 100 MB limit"
-                                )
-            else:
-                content_text = message.get("content", "")
-
-                # Check for thinking blocks with signatures in the text
-                # Format: <think>\n...\n<!-- signature: ... -->\n</think>
-                # OR: <think>...</think>\n[//]: # (signature: ...) (New Markdown)
-                # OR: <think>...</think>\n<!-- signature: ... --> (Old HTML)
-                # OR: <think>...\n<!-- signature: ... --></think> (Oldest)
-                thinking_match = re.search(
-                    r"<think>(.*?)</think>", content_text, re.DOTALL
-                )
-
-                if thinking_match and message["role"] == "assistant":
-                    thinking_content = thinking_match.group(1)
-                    signature = None
-
-                    # Check for signature inside (oldest format)
-                    inside_match = re.search(
-                        r"<!-- signature: (.*?) -->", thinking_content
-                    )
-                    if inside_match:
-                        signature = inside_match.group(1)
-                        thinking_content = thinking_content.replace(
-                            inside_match.group(0), ""
-                        )
-                    else:
-                        # Check for signature after (HTML format)
-                        after_html_match = re.search(
-                            r"</think>\s*<!-- signature: (.*?) -->",
-                            content_text,
-                            re.DOTALL,
-                        )
-                        if after_html_match:
-                            signature = after_html_match.group(1)
-                        else:
-                            # Check for signature after (Markdown format)
-                            after_md_match = re.search(
-                                r"</think>\s*\[//\]: # \(signature: (.*?)\)",
-                                content_text,
-                                re.DOTALL,
-                            )
-                            if after_md_match:
-                                signature = after_md_match.group(1)
-
-                    thinking_content = thinking_content.strip()
-
-                    # Remove the thinking block and signature from the text content
-                    # Remove Markdown signature
-                    text_content = re.sub(
-                        r"<think>.*?</think>(?:\s*\[//\]: # \(signature: .*?\))?\s*",
-                        "",
-                        content_text,
-                        flags=re.DOTALL,
-                    )
-                    # Remove HTML signature (if present instead)
-                    text_content = re.sub(
-                        r"<think>.*?</think>(?:\s*<!-- signature: .*? -->)?\s*",
-                        "",
-                        text_content,
-                        flags=re.DOTALL,
-                    ).strip()
-
-                    # Create the thinking block
-                    thinking_block = {"type": "thinking", "thinking": thinking_content}
-
-                    if signature:
-                        thinking_block["signature"] = signature
-
-                    processed_content.append(thinking_block)
-
-                    # Add remaining text if any
-                    if text_content:
-                        processed_content.append({"type": "text", "text": text_content})
-                else:
-                    processed_content = [{"type": "text", "text": content_text}]
-
-            processed_messages.append(
-                {"role": message["role"], "content": processed_content}
-            )
-
-            # Add tools for supported models
+        # Add tools for supported models
         tools = []
 
         # Add web search tool if supported by model and enabled
@@ -872,6 +1015,19 @@ class Pipe:
                 }
             )
 
+        # Add the tools enabled in Open WebUI, minus any builtin that
+        # duplicates a server tool declared above
+        server_tool_names = {tool["name"] for tool in tools}
+        replaced_tools = set().union(
+            *(self.OWUI_TOOLS_REPLACED_BY.get(name, set()) for name in server_tool_names)
+        )
+        owui_tools, tool_names = self._convert_owui_tools(
+            body.get("tools"), replaced_tools, server_tool_names
+        )
+        if owui_tools:
+            tools.extend(owui_tools)
+            print(f"Open WebUI tools for {model_name}: {', '.join(tool_names.values())}")
+
         # Convert to None if no tools
         tools = tools if tools else None
 
@@ -899,7 +1055,7 @@ class Pipe:
             # existing default and harmless.
             if model_name in self.ADAPTIVE_THINKING_MODELS:
                 # Thinking display. Default "summarized" so the model's reasoning is
-                # visible in <think> blocks. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
+                # visible in the Thoughts section. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
                 # default to "omitted" (empty thinking text) at the API level, so we
                 # set this explicitly.
                 display = (
@@ -1049,7 +1205,17 @@ class Pipe:
 
         # Add optional parameters
         if system_message:
-            params["system"] = str(system_message)
+            # pop_system_message returns the whole message dict; send only its
+            # text rather than the dict's repr.
+            system_content = system_message.get("content")
+            if isinstance(system_content, list):
+                system_content = "\n".join(
+                    part.get("text", "")
+                    for part in system_content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if system_content:
+                params["system"] = str(system_content)
 
         if body.get("stop"):
             params["stop_sequences"] = body.get("stop")
@@ -1067,9 +1233,11 @@ class Pipe:
 
         try:
             if body.get("stream", False):
-                return self.stream_response_sdk(params)
+                return self.stream_response_sdk(params, tool_names)
             else:
-                return self.non_stream_response_sdk(params)
+                # Awaited here: Open WebUI awaits pipe() itself but not a
+                # coroutine it returns, which would leave the reply empty
+                return await self.non_stream_response_sdk(params, tool_names)
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)
@@ -1087,14 +1255,34 @@ class Pipe:
             print(error_msg)
             return error_msg
 
-    async def stream_response_sdk(self, params):
+    async def stream_response_sdk(self, params, tool_names=None):
+        """Stream a response to Open WebUI.
+
+        `tool_names` maps API tool names back to Open WebUI tool names.
+        """
+        tool_names = tool_names or {}
         try:
             self.show_code_execution = self._code_execution_declared(params)
+            # Whether thinking blocks will arrive without readable text:
+            # display "omitted" is the API default wherever the pipe doesn't set
+            # display itself, and manual (budget) thinking is always summarized.
+            thinking_config = params.get("thinking") or {}
+            hide_thinking_text = (
+                thinking_config.get("type") != "enabled"
+                and thinking_config.get("display", "omitted") == "omitted"
+            )
             with self.client.messages.stream(**params) as stream:
                 # For extended thinking: handle thinking blocks in the stream
                 self.is_thinking = False
-                self.thinking_start_time = None
                 self.thinking_signature = None
+                thinking_text = ""
+                thinking_shown = False
+                reasoning_blocks = 0
+                # Client tool calls by content block index. They are passed to
+                # Open WebUI only once the stop reason is known, so a call cut
+                # off by max_tokens or a refusal is never run.
+                tool_calls = {}
+                stop_reason = None
                 # Track code execution state
                 self.is_code_execution = False
                 self.code_execution_block_index = None
@@ -1146,23 +1334,36 @@ class Pipe:
                             # mid-stream (or before any output) — the stream
                             # ends normally, so surface it explicitly.
                             delta = getattr(event, "delta", None)
-                            if getattr(delta, "stop_reason", None) == "refusal":
+                            stop_reason = getattr(delta, "stop_reason", None) or stop_reason
+                            if stop_reason == "refusal":
                                 refused = True
                                 refusal_stop_details = getattr(
                                     delta, "stop_details", None
                                 )
 
-                        # Handle thinking content block start
+                        # Handle thinking content block start. Reasoning goes
+                        # to Open WebUI as reasoning_content, which it shows in
+                        # the Thoughts section, never as reply text.
                         if (
                             event.type == "content_block_start"
                             and hasattr(event, "content_block")
                             and event.content_block.type == "thinking"
                         ):
                             self.is_thinking = True
-                            self.thinking_start_time = time.time()
                             self.thinking_signature = None
-                            # Yield opening tag for thinking block
-                            yield "<think>\n"
+                            thinking_text = ""
+                            thinking_shown = hide_thinking_text
+                            if reasoning_blocks:
+                                # Open WebUI adds every thinking block in a
+                                # response to one Thoughts section
+                                yield self._delta(reasoning_content="\n\n")
+                            reasoning_blocks += 1
+                            if hide_thinking_text:
+                                # Open the Thoughts section now so its timer
+                                # covers the time spent thinking
+                                yield self._delta(
+                                    reasoning_content=self.THINKING_HIDDEN_NOTE
+                                )
 
                         # Handle redacted thinking content block start
                         elif (
@@ -1170,8 +1371,47 @@ class Pipe:
                             and hasattr(event, "content_block")
                             and event.content_block.type == "redacted_thinking"
                         ):
-                            # Show user-friendly message for redacted thinking
-                            yield "\n*[Some reasoning has been encrypted for safety]*\n\n"
+                            # Show user-friendly message for redacted thinking,
+                            # and keep the encrypted block for the next request
+                            separator = "\n\n" if reasoning_blocks else ""
+                            reasoning_blocks += 1
+                            yield self._delta(
+                                reasoning_content=separator + self.REDACTED_THINKING_NOTE,
+                                reasoning_details=[
+                                    self._redacted_thinking_detail(
+                                        event.content_block.data
+                                    )
+                                ],
+                            )
+
+                        # Handle client tool call start (Open WebUI tools)
+                        elif (
+                            event.type == "content_block_start"
+                            and hasattr(event, "content_block")
+                            and event.content_block.type == "tool_use"
+                        ):
+                            tool_calls[event.index] = {
+                                "index": len(tool_calls),
+                                "id": event.content_block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_names.get(
+                                        event.content_block.name,
+                                        event.content_block.name,
+                                    ),
+                                    "arguments": "",
+                                },
+                            }
+
+                        # Handle client tool call input deltas
+                        elif (
+                            event.type == "content_block_delta"
+                            and getattr(event, "index", None) in tool_calls
+                            and event.delta.type == "input_json_delta"
+                        ):
+                            tool_calls[event.index]["function"][
+                                "arguments"
+                            ] += event.delta.partial_json
 
                         # Handle thinking content deltas
                         elif (
@@ -1184,7 +1424,12 @@ class Pipe:
                                 event.delta, "thinking"
                             ):
                                 # Yield thinking content as it arrives
-                                yield event.delta.thinking
+                                thinking_text += event.delta.thinking
+                                if event.delta.thinking:
+                                    thinking_shown = True
+                                    yield self._delta(
+                                        reasoning_content=event.delta.thinking
+                                    )
                             elif event.delta.type == "signature_delta" and hasattr(
                                 event.delta, "signature"
                             ):
@@ -1196,21 +1441,24 @@ class Pipe:
                         # Handle thinking content block end
                         elif self.is_thinking and event.type == "content_block_stop":
                             self.is_thinking = False
-                            thinking_time = None
-                            if self.thinking_start_time:
-                                thinking_time = time.time() - self.thinking_start_time
-                                self.thinking_start_time = None
+                            if not thinking_shown:
+                                yield self._delta(
+                                    reasoning_content=self.THINKING_HIDDEN_NOTE
+                                )
 
-                            # Inject signature if present
-                            # Close the thinking block
-                            yield "\n</think>"
-
-                            # Inject signature if present
+                            # Attach the block and its signature to the
+                            # Thoughts item. Open WebUI replays it on the
+                            # assistant message in later requests, which keeps
+                            # the signature out of the reply text entirely.
                             if self.thinking_signature:
-                                yield f"\n[//]: # (signature: {self.thinking_signature})"
+                                yield self._delta(
+                                    reasoning_details=[
+                                        self._thinking_detail(
+                                            thinking_text, self.thinking_signature
+                                        )
+                                    ]
+                                )
                                 self.thinking_signature = None
-
-                            yield "\n\n"
 
                         # Handle any tool use start (web search, code execution, etc.)
                         elif (
@@ -1498,6 +1746,13 @@ class Pipe:
                         f"(model: {params['model']})."
                     )
                     yield self._refusal_notice(refusal_stop_details)
+                elif tool_calls and stop_reason == "tool_use":
+                    # Hand the calls to Open WebUI, which runs them and calls
+                    # the pipe again with the results
+                    for tool_call in tool_calls.values():
+                        if not tool_call["function"]["arguments"]:
+                            tool_call["function"]["arguments"] = "{}"
+                    yield self._delta(tool_calls=list(tool_calls.values()))
 
             # Calculate and emit usage. With prompt caching, input_tokens only
             # counts tokens after the cache breakpoint — the cached prefix is
@@ -1547,7 +1802,13 @@ class Pipe:
             print(error_msg)
             yield error_msg
 
-    async def non_stream_response_sdk(self, params):
+    async def non_stream_response_sdk(self, params, tool_names=None):
+        """Return a complete response as an OpenAI-format chat completion.
+
+        Thinking goes in `reasoning_content` / `reasoning_details` and client
+        tool calls in `tool_calls`, as in the streamed version.
+        """
+        tool_names = tool_names or {}
         try:
             start_time = time.time()
             self.show_code_execution = self._code_execution_declared(params)
@@ -1568,32 +1829,45 @@ class Pipe:
             # Handle different content types in the response
             if hasattr(response, "content") and response.content:
                 result_parts = []
+                reasoning_parts = []
+                reasoning_details = []
+                tool_calls = []
                 all_citations = []
 
                 for content_block in response.content:
                     # Handle thinking content blocks
                     if content_block.type == "thinking":
-                        if (
-                            hasattr(content_block, "thinking")
-                            and content_block.thinking
-                        ):
-                            signature_part = ""
-                            if (
-                                hasattr(content_block, "signature")
-                                and content_block.signature
-                            ):
-                                signature_part = (
-                                    f"\n[//]: # (signature: {content_block.signature})"
+                        if getattr(content_block, "thinking", None):
+                            reasoning_parts.append(content_block.thinking)
+                        if getattr(content_block, "signature", None):
+                            reasoning_details.append(
+                                self._thinking_detail(
+                                    content_block.thinking or "",
+                                    content_block.signature,
                                 )
-
-                            result_parts.append(
-                                f"<think>\n{content_block.thinking}\n</think>{signature_part}\n\n"
                             )
 
                     # Handle redacted thinking content blocks
                     elif content_block.type == "redacted_thinking":
-                        result_parts.append(
-                            "\n*[Some reasoning has been encrypted for safety]*\n\n"
+                        reasoning_parts.append(self.REDACTED_THINKING_NOTE)
+                        reasoning_details.append(
+                            self._redacted_thinking_detail(content_block.data)
+                        )
+
+                    # Handle client tool calls (Open WebUI tools)
+                    elif content_block.type == "tool_use":
+                        tool_calls.append(
+                            {
+                                "index": len(tool_calls),
+                                "id": content_block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_names.get(
+                                        content_block.name, content_block.name
+                                    ),
+                                    "arguments": json.dumps(content_block.input),
+                                },
+                            }
                         )
 
                     # Handle text content
@@ -1838,7 +2112,33 @@ class Pipe:
                 if refusal_notice:
                     result_parts.append(refusal_notice)
 
-                return "".join(result_parts)
+                message = {"role": "assistant", "content": "".join(result_parts)}
+                if reasoning_details and not reasoning_parts:
+                    reasoning_parts.append(self.THINKING_HIDDEN_NOTE)
+                if reasoning_parts:
+                    message["reasoning_content"] = "\n\n".join(reasoning_parts)
+                if reasoning_details:
+                    message["reasoning_details"] = reasoning_details
+                # Only a turn that ended to call tools gets them run; one cut
+                # off by max_tokens or a refusal may hold incomplete calls
+                if tool_calls and response.stop_reason == "tool_use":
+                    message["tool_calls"] = tool_calls
+
+                return {
+                    "id": response.id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": params["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": (
+                                "tool_calls" if "tool_calls" in message else "stop"
+                            ),
+                        }
+                    ],
+                }
 
             return refusal_notice
         except anthropic.AuthenticationError as e:

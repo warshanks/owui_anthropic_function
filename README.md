@@ -1,18 +1,20 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.18.0-blue)
+![Version](https://img.shields.io/badge/version-0.19.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
 
 ## Features
 
+- **Open WebUI Tools**: Tools enabled for a chat in Open WebUI (workspace tools, MCP servers, tool servers, and Open WebUI's builtin tools) are offered to Claude through native function calling, Open WebUI's default mode. Claude's tool calls are handed back to Open WebUI, which runs them, shows them in the chat, and calls the pipe again with the results.
 - **Web Search**: Enable Claude to search the web for real-time information. On Claude 4.6+ models the pipe uses the dynamic-filtering tool version, so Claude filters results with code before they reach the context window (fewer input tokens on search-heavy turns).
 - **Web Fetch**: Fetch and process content from specific URLs for deeper analysis, with the same dynamic filtering on Claude 4.6+ models.
 - **Code Execution**: Run Python code in Anthropic's secure sandbox environment for calculations, data analysis, and more.
 - **Extended Thinking**: Leverage Claude's extended thinking for complex problem-solving. Newer models (Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.7/4.6, Sonnet 4.6) use **adaptive thinking** (Claude decides when and how much to think); older models use a configurable token budget. On Opus 5 thinking is on by default at the API level, so `ENABLE_THINKING=false` is sent as an explicit disabled config. On Opus 5.5, Fable 5.1 and Fable 5 it cannot be turned off at all.
 - **Effort Control**: Guide how much adaptive-thinking models reason via the `EFFORT` valve (`low`, `medium`, `high`, `xhigh`, `max`). `xhigh` is available everywhere except Opus 4.6 / Sonnet 4.6. Leaving the valve empty uses the API default: `high` on most models, `medium` on Opus 5.5.
-- **Thinking Display**: Adaptive-thinking reasoning defaults to `summarized` (shown in `<think>` blocks) via the `THINKING_DISPLAY` valve; set to `omitted` for lower latency. This overrides the API-level `omitted` default on Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8/4.7 so it's visible the model thought.
+- **Thinking Display**: Reasoning is streamed into Open WebUI's collapsible Thoughts section, never into the reply text. Adaptive-thinking reasoning defaults to `summarized` via the `THINKING_DISPLAY` valve; set to `omitted` for lower latency (the Thoughts section then shows a short note instead). This overrides the API-level `omitted` default on Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8/4.7 so it's visible the model thought.
+- **Thinking Across Turns**: Each thinking block's signature is sent to Open WebUI as structured `reasoning_details`, which Open WebUI stores and passes back on later requests to the same model, so thinking blocks are replayed to Claude, including through tool calls, without the signature ever appearing in the chat.
 - **Preserved Thinking**: On Claude Fable 5.1 and Claude Opus 5.5 each thinking block is bound to the conversation prefix that produced it, so editing or regenerating an earlier message would otherwise fail the next request with a 400. The pipe opts into `prefix_mismatch_behavior: drop_block`, and the API drops invalidated blocks (unbilled) instead of rejecting the request.
 - **Refusal Handling**: Requests declined by Anthropic's safety classifiers (`stop_reason: "refusal"`, returned as a normal HTTP 200) surface a notice with the refusal category instead of an empty reply.
 - **Prompt Caching**: Automatic caching of the conversation prefix (`ENABLE_PROMPT_CACHING` valve, on by default). Follow-up turns re-read prior history at ~10% of the input price instead of reprocessing it in full (2.5% on Fable 5.1, 5% on Opus 5.5). The `CACHE_TTL` valve selects a `5m` (default) or `1h` cache lifetime.
@@ -53,13 +55,22 @@ You can configure the pipe using **Valves**. These can be set globally by the ad
 ## Usage
 
 ### Extended Thinking
-When using a supported model, the model may utilize "thinking" blocks to reason through complex problems before answering. These blocks are displayed as:
-```
-<think>
-... reasoning process ...
-</think>
-```
+When using a supported model, the model may utilize "thinking" blocks to reason through complex problems before answering. The reasoning streams into Open WebUI's collapsible Thoughts section above the reply.
+
+Open WebUI keeps each thinking block's signature with the reply and passes it back to the pipe on later requests to the same model, so earlier thinking is replayed to Claude. Replies saved by earlier versions of the pipe, which stored the signature as a comment in the reply text, are still read, and the comment is stripped before the history is sent to Claude.
+
 *Note: On budget-based models (e.g. Opus 4.5, Sonnet 4.5), thinking requires a minimum budget of 1,024 tokens and the budget must be less than `MAX_TOKENS`. On adaptive-thinking models (Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.7/4.6, Sonnet 4.6), the budget is ignored — Claude allocates thinking automatically, optionally guided by the `EFFORT` valve. On Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8/4.7, adaptive is the only thinking mode (manual budgets are rejected by the API). Because Opus 5.5, Fable 5.1 and Opus 5 think by default, their `MAX_TOKENS` has to cover thinking plus the answer.*
+
+### Open WebUI Tools
+Enable tools for a model or chat as usual (workspace tools, MCP servers, tool servers). With Open WebUI's default **native** function calling, the pipe converts every tool Open WebUI offers into an Anthropic tool definition. When Claude calls tools, the pipe passes the calls to Open WebUI, which runs them (including tool approval prompts and browser-side tool servers), displays them in the chat, and calls the pipe again with the results. Thinking blocks come back with that follow-up request, as the API requires during tool use.
+
+Tool calls are only handed over when Claude's turn actually ended to call them, never when a reply was cut off by `MAX_TOKENS` or a safety refusal. Tool names with characters the API doesn't accept (common with MCP servers) are rewritten to underscores for the API and mapped back for Open WebUI.
+
+When the web search, URL context or code interpreter toggle is on, the pipe uses Anthropic's own server tool and drops Open WebUI's equivalent builtin (`search_web`, `fetch_url` or `execute_code`) so Claude isn't offered two tools for the same job.
+
+In **legacy** function calling, Open WebUI resolves tools itself before the pipe runs and injects the results into the prompt, so no tools are sent to Claude.
+
+This relies on Open WebUI 0.10 or later, which carries `reasoning_details` between turns.
 
 ### Code Execution
 If enabled, Claude can write and execute Python code. The code and its output (stdout/stderr) will be displayed in the chat:

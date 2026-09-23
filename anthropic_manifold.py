@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.17.0
+version: 0.18.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -16,7 +16,7 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
 - Safety-classifier refusals surfaced instead of returning an empty response
-- Preserved-thinking prefix binding handled on Claude Fable 5.1
+- Preserved-thinking prefix binding handled on Claude Fable 5.1 and Claude Opus 5.5
 """
 
 import os
@@ -134,16 +134,18 @@ class Pipe:
             description=(
                 "Enable Claude's extended thinking capability for supported models. "
                 "On Opus 5 thinking is on by default at the API level, so turning "
-                "this off sends an explicit disabled config. Fable 5 always thinks "
-                "(the API rejects disabling it), so this valve has no effect there."
+                "this off sends an explicit disabled config. Opus 5.5, Fable 5.1 "
+                "and Fable 5 always think (the API rejects disabling it), so this "
+                "valve has no effect there; lower EFFORT instead."
             ),
         )
         EFFORT: str = Field(
             default="",
             description=(
-                "Effort level for adaptive-thinking models (Opus 5, Fable 5, "
-                "Sonnet 5, Opus 4.8, Opus 4.6, Sonnet 4.6). "
-                "One of: low, medium, high, xhigh, max. Empty = API default (high). "
+                "Effort level for adaptive-thinking models (Opus 5.5, Fable 5.1, "
+                "Opus 5, Fable 5, Sonnet 5, Opus 4.8, Opus 4.6, Sonnet 4.6). "
+                "One of: low, medium, high, xhigh, max. Empty = API default "
+                "(medium on Opus 5.5, high elsewhere). "
                 "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6."
             ),
         )
@@ -154,8 +156,8 @@ class Pipe:
                 "model's reasoning in <think> blocks; 'omitted' hides the reasoning "
                 "text for lower streaming latency (the <think> block still appears, "
                 "just empty). Defaults to 'summarized' so it's clear the model thought. "
-                "Note: Opus 5, Fable 5, Sonnet 5 and Opus 4.8 default to 'omitted' at "
-                "the API level; this valve overrides that. You are billed for thinking "
+                "Note: Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8 "
+                "default to 'omitted' at the API level; this valve overrides that. You are billed for thinking "
                 "tokens either way."
             ),
         )
@@ -220,6 +222,7 @@ class Pipe:
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "web_search": {
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
@@ -241,6 +244,7 @@ class Pipe:
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
             "web_fetch": {
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
@@ -260,6 +264,7 @@ class Pipe:
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
@@ -284,6 +289,7 @@ class Pipe:
             # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "dynamic_web_tools": {
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
@@ -295,6 +301,7 @@ class Pipe:
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
@@ -318,6 +325,7 @@ class Pipe:
         # a 400 on all of these, so they must never take the budget path.
         self.ADAPTIVE_THINKING_MODELS = {
             "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5",
             "claude-sonnet-5",
@@ -336,6 +344,7 @@ class Pipe:
         # `{"type": "disabled"}` config rather than leaving it out.
         self.THINKING_ON_BY_DEFAULT_MODELS = {
             "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5",
         }
@@ -343,7 +352,11 @@ class Pipe:
         # Models that reject `{"type": "disabled"}` outright — thinking is
         # always on and the parameter has to be omitted (or sent as
         # `{"type": "adaptive"}`).
-        self.THINKING_ALWAYS_ON_MODELS = {"claude-fable-5-1", "claude-fable-5"}
+        self.THINKING_ALWAYS_ON_MODELS = {
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-fable-5",
+        }
 
         # Models that bind each thinking block to the conversation prefix that
         # produced it. Editing anything before a thinking block (an earlier
@@ -352,14 +365,16 @@ class Pipe:
         # to a different conversation") on accounts created on or after
         # 2026-08-31. Open WebUI lets users edit and regenerate earlier turns,
         # so the pipe opts into dropping invalidated blocks instead.
-        self.PREFIX_BINDING_MODELS = {"claude-fable-5-1"}
+        self.PREFIX_BINDING_MODELS = {"claude-fable-5-1", "claude-opus-5-5"}
 
         # Pricing per million tokens (Input / Output)
         # NOTE: _get_pricing matches by substring, so longer model IDs must
-        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1".
+        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1" and
+        # "claude-opus-5" is a prefix of "claude-opus-5-5".
         self.PRICING = {
             # Claude 5 family
             "claude-fable-5-1": {"input": 10.00, "output": 50.00},
+            "claude-opus-5-5": {"input": 4.00, "output": 20.00},
             "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
             "claude-sonnet-5": {"input": 2.00, "output": 10.00},
@@ -386,10 +401,13 @@ class Pipe:
         }
 
         # Cache reads cost 0.10x the base input price on every model except
-        # Claude Fable 5.1, where they cost 0.025x ($0.25 per MTok against a
-        # $10 input price).
+        # Claude Fable 5.1 (0.025x: $0.25 per MTok against a $10 input price)
+        # and Claude Opus 5.5 (0.05x: $0.20 per MTok against a $4 input price).
         self.CACHE_READ_MULTIPLIER = 0.10
-        self.REDUCED_CACHE_READ_MODELS = {"claude-fable-5-1"}
+        self.REDUCED_CACHE_READ_MODELS = {
+            "claude-fable-5-1": 0.025,
+            "claude-opus-5-5": 0.05,
+        }
 
         # Cost per web search request ($10 per 1,000 searches)
         self.WEB_SEARCH_COST = 0.01
@@ -400,8 +418,9 @@ class Pipe:
 
     def get_anthropic_models(self):
         return [
-            {"id": "claude-opus-5", "name": "claude-opus-5"},
+            {"id": "claude-opus-5-5", "name": "claude-opus-5-5"},
             {"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
+            {"id": "claude-opus-5", "name": "claude-opus-5"},
             # {"id": "claude-fable-5", "name": "claude-fable-5"},
             {"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             # {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
@@ -438,9 +457,9 @@ class Pipe:
 
     def _cache_read_multiplier(self, model_name: str) -> float:
         """Cache-hit price as a fraction of the base input price."""
-        for key in self.REDUCED_CACHE_READ_MODELS:
+        for key, multiplier in self.REDUCED_CACHE_READ_MODELS.items():
             if key in model_name:
-                return 0.025
+                return multiplier
         return self.CACHE_READ_MULTIPLIER
 
     def _calculate_cost(
@@ -490,8 +509,8 @@ class Pipe:
     def _refusal_notice(self, stop_details=None) -> str:
         """Build a user-facing notice for a `stop_reason: "refusal"` response.
 
-        Opus 5 (like Fable 5) runs safety classifiers that can decline a
-        request. That comes back as a successful HTTP 200 with an empty or
+        Opus 5.5 / Opus 5 (like Fable 5.1 / Fable 5) run safety classifiers that
+        can decline a request. That comes back as a successful HTTP 200 with an empty or
         partial content list, so without this the user would just see a blank
         reply with no explanation.
         """
@@ -981,8 +1000,8 @@ class Pipe:
             params["thinking"] = {"type": "disabled"}
             print(f"Disabling thinking for {model_name} (thinking is on by default)")
         elif model_name in self.THINKING_ALWAYS_ON_MODELS:
-            # Fable 5 / Fable 5.1 reject `{"type": "disabled"}` at any effort —
-            # thinking is always on and the parameter must be omitted.
+            # Opus 5.5 / Fable 5.1 / Fable 5 reject `{"type": "disabled"}` at any
+            # effort — thinking is always on and the parameter must be omitted.
             print(
                 f"Thinking cannot be disabled on {model_name}; leaving it on (API default)."
             )

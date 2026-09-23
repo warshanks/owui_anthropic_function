@@ -16,22 +16,20 @@ The following table shows pricing for all Claude models across different usage t
 |-------------------|-------------------|-----------------|-----------------|----------------------|---------------|
 | Claude Fable 5.1  | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $0.25 / MTok<sup>1</sup> | $50 / MTok    |
 | Claude Fable 5    | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $1 / MTok    | $50 / MTok    |
+| Claude Opus 5.5   | $4 / MTok         | $5 / MTok       | $8 / MTok       | $0.20 / MTok<sup>2</sup> | $20 / MTok    |
 | Claude Opus 5     | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
-| Claude Sonnet 5   | $2 / MTok         | $2.50 / MTok    | $4 / MTok       | $0.20 / MTok | $10 / MTok    |
+| Claude Sonnet 5<sup>3</sup> | $2 / MTok | $2.50 / MTok    | $4 / MTok       | $0.20 / MTok | $10 / MTok    |
 | Claude Opus 4.8   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.7   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.6   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.5   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
-| Claude Opus 4.1   | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
-| Claude Opus 4     | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
+| Claude Opus 4.1 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |
+| Claude Opus 4 ([retired, except on Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |
 | Claude Sonnet 4.6   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 4.5   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
-| Claude Sonnet 4   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
-| Claude Sonnet 3.7 ([deprecated](/docs/en/about-claude/model-deprecations)) | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
+| Claude Sonnet 4 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
 | Claude Haiku 4.5  | $1 / MTok         | $1.25 / MTok    | $2 / MTok       | $0.10 / MTok | $5 / MTok     |
-| Claude Haiku 3.5  | $0.80 / MTok      | $1 / MTok       | $1.6 / MTok     | $0.08 / MTok | $4 / MTok     |
-| Claude Opus 3 ([deprecated](/docs/en/about-claude/model-deprecations))    | $15 / MTok        | $18.75 / MTok   | $30 / MTok      | $1.50 / MTok | $75 / MTok    |
-| Claude Haiku 3    | $0.25 / MTok      | $0.30 / MTok    | $0.50 / MTok    | $0.03 / MTok | $1.25 / MTok  |
+| Claude Haiku 3.5 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $0.80 / MTok | $1 / MTok | $1.60 / MTok | $0.08 / MTok | $4 / MTok |
 
 <Note>
 MTok = Million tokens. The "Base Input Tokens" column shows standard input pricing, "Cache Writes" and "Cache Hits" are specific to [prompt caching](/docs/en/build-with-claude/prompt-caching), and "Output Tokens" shows output pricing. Prompt caching offers both 5-minute (default) and 1-hour cache durations to optimize costs for different use cases.
@@ -39,9 +37,15 @@ MTok = Million tokens. The "Base Input Tokens" column shows standard input prici
 The table above reflects the following pricing multipliers for prompt caching:
 - 5-minute cache write tokens are 1.25 times the base input tokens price
 - 1-hour cache write tokens are 2 times the base input tokens price
-- Cache read tokens are 0.1 times the base input tokens price
+- Cache read tokens are 0.1 times the base input tokens price (0.025x on Claude Fable 5.1, 0.05x on Claude Opus 5.5)
 
-<sup>1</sup> Cache hits and refreshes on Claude Fable 5.1 (and Claude Mythos 5.1) are priced at 0.025 times the base input price. All other models use the standard 0.1x multiplier.
+<sup>1</sup> Cache hits and refreshes on Claude Fable 5.1 (and Claude Mythos 5.1) are priced at 0.025 times the base input price.
+
+<sup>2</sup> Cache hits and refreshes on Claude Opus 5.5 are priced at 0.05 times the base input price. All other models use the standard 0.1x multiplier.
+
+<sup>3</sup> The $2 / $10 Claude Sonnet 5 price, announced at launch as introductory pricing through August 31, 2026, is now the standard price; the scheduled increase to $3 / $15 will not occur.
+
+Claude Sonnet 3.7, Claude Opus 3, and Claude Haiku 3 are retired and no longer listed. Claude Mythos 5.1 / Mythos 5 (limited availability, Project Glasswing) are priced the same as Claude Fable 5.1 / Fable 5.
 </Note>
 
 ## Third-party platform pricing
@@ -77,69 +81,41 @@ The Batch API allows asynchronous processing of large volumes of requests with a
 |-------------------|------------------|-----------------|
 | Claude Fable 5.1    | $5 / MTok        | $25 / MTok      |
 | Claude Fable 5      | $5 / MTok        | $25 / MTok      |
+| Claude Opus 5.5     | $2 / MTok        | $10 / MTok      |
 | Claude Opus 5       | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Sonnet 5     | $1 / MTok        | $5 / MTok       |
 | Claude Opus 4.8     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.7     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.6     | $2.50 / MTok     | $12.50 / MTok   |
 | Claude Opus 4.5     | $2.50 / MTok     | $12.50 / MTok   |
-| Claude Opus 4.1     | $7.50 / MTok     | $37.50 / MTok   |
-| Claude Opus 4     | $7.50 / MTok     | $37.50 / MTok   |
+| Claude Opus 4.1 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $7.50 / MTok | $37.50 / MTok |
+| Claude Opus 4 ([retired, except on Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $7.50 / MTok | $37.50 / MTok |
 | Claude Sonnet 4.6   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 4.5   | $1.50 / MTok     | $7.50 / MTok    |
-| Claude Sonnet 4   | $1.50 / MTok     | $7.50 / MTok    |
-| Claude Sonnet 3.7 ([deprecated](/docs/en/about-claude/model-deprecations)) | $1.50 / MTok     | $7.50 / MTok    |
+| Claude Sonnet 4 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $1.50 / MTok | $7.50 / MTok |
 | Claude Haiku 4.5  | $0.50 / MTok     | $2.50 / MTok    |
-| Claude Haiku 3.5  | $0.40 / MTok     | $2 / MTok       |
-| Claude Opus 3 ([deprecated](/docs/en/about-claude/model-deprecations))  | $7.50 / MTok     | $37.50 / MTok   |
-| Claude Haiku 3    | $0.125 / MTok    | $0.625 / MTok   |
+| Claude Haiku 3.5 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $0.40 / MTok | $2 / MTok |
 
 For more information about batch processing, see our [batch processing documentation](/docs/en/build-with-claude/batch-processing).
 
 ### Long context pricing
 
-When using Claude Sonnet 4 or Sonnet 4.5 with the [1M token context window enabled](/docs/en/build-with-claude/context-windows#1m-token-context-window), requests that exceed 200K input tokens are automatically charged at premium long context rates:
+Claude 4.6 and later models include the full 1M token context window at standard pricing (a 900K-token request is billed at the same per-token rate as a 9K-token request). Prompt caching and batch discounts apply at standard rates across the full context window.
 
-<Note>
-The 1M token context window is currently in beta for organizations in [usage tier](/docs/en/api/rate-limits) 4 and organizations with custom rate limits. The 1M token context window is only available for Claude Sonnet 4 and Sonnet 4.5.
-</Note>
+### Fast mode pricing
 
-| ≤ 200K input tokens | > 200K input tokens |
-|-----------------------------------|-------------------------------------|
-| Input: $3 / MTok | Input: $6 / MTok |
-| Output: $15 / MTok | Output: $22.50 / MTok |
+Fast mode (research preview, Claude API only; not used by this pipe) runs Claude Opus 5.5, Claude Opus 5, and Claude Opus 4.8 with significantly faster output at premium pricing:
 
-Long context pricing stacks with other pricing modifiers:
-- The [Batch API 50% discount](#batch-processing) applies to long context pricing
-- [Prompt caching multipliers](#model-pricing) apply on top of long context pricing
+| Model                           | Input      | Output     |
+|---------------------------------|------------|------------|
+| Claude Opus 5.5                 | $8 / MTok  | $40 / MTok |
+| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |
 
-<Note>
-Even with the beta flag enabled, requests with fewer than 200K input tokens are charged at standard rates. If your request exceeds 200K input tokens, all tokens incur premium pricing.
+Prompt caching and data residency multipliers stack on top of fast mode pricing. Fast mode is not available with the Batch API.
 
-The 200K threshold is based solely on input tokens (including cache reads/writes). Output token count does not affect pricing tier selection, though output tokens are charged at the higher rate when the input threshold is exceeded.
-</Note>
+### Data residency pricing
 
-To check if your API request was charged at the 1M context window rates, examine the `usage` object in the API response:
-
-```json
-{
-  "usage": {
-    "input_tokens": 250000,
-    "cache_creation_input_tokens": 0,
-    "cache_read_input_tokens": 0,
-    "output_tokens": 500
-  }
-}
-```
-
-Calculate the total input tokens by summing:
-- `input_tokens`
-- `cache_creation_input_tokens` (if using prompt caching)
-- `cache_read_input_tokens` (if using prompt caching)
-
-If the total exceeds 200,000 tokens, the entire request was billed at 1M context rates.
-
-For more information about the `usage` object, see the [API response documentation](/docs/en/api/messages#response-usage).
+For Claude 4.6 and later models, US-only inference (`inference_geo: "us"`) applies a 1.1x multiplier to all token categories. Global routing (the default, and what this pipe uses) is standard pricing.
 
 ### Tool use pricing
 

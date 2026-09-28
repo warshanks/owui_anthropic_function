@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.19.0
+version: 0.20.0
 license: MIT
 
 This pipe provides access to Anthropic's Claude models with support for:
@@ -20,7 +20,10 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Centralized model capability management
 - Proper handling of redacted thinking and streaming requirements
 - Safety-classifier refusals surfaced instead of returning an empty response
-- Preserved-thinking prefix binding handled on Claude Fable 5.1 and Claude Opus 5.5
+- Preserved-thinking prefix binding handled on Claude Fable 5.1, Claude Opus 5.5
+  and Claude Sonnet 5.5
+- Claude Sonnet 5.5 "between tools" thinking (its lowest setting, since it rejects
+  turning thinking off)
 """
 
 import json
@@ -138,20 +141,24 @@ class Pipe:
             default=True,
             description=(
                 "Enable Claude's extended thinking capability for supported models. "
-                "On Opus 5 thinking is on by default at the API level, so turning "
-                "this off sends an explicit disabled config. Opus 5.5, Fable 5.1 "
-                "and Fable 5 always think (the API rejects disabling it), so this "
-                "valve has no effect there; lower EFFORT instead."
+                "On Opus 5 and Sonnet 5 thinking is on by default at the API level, "
+                "so turning this off sends an explicit disabled config. Sonnet 5.5 "
+                "rejects disabled, so turning this off sends its lowest setting, "
+                "'between tools', where it only thinks between tool calls. Opus 5.5, "
+                "Fable 5.1 and Fable 5 always think (the API rejects disabling it), "
+                "so this valve has no effect there; lower EFFORT instead."
             ),
         )
         EFFORT: str = Field(
             default="",
             description=(
                 "Effort level for adaptive-thinking models (Opus 5.5, Fable 5.1, "
-                "Opus 5, Fable 5, Sonnet 5, Opus 4.8, Opus 4.6, Sonnet 4.6). "
-                "One of: low, medium, high, xhigh, max. Empty = API default "
-                "(medium on Opus 5.5, high elsewhere). "
-                "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6."
+                "Opus 5, Fable 5, Sonnet 5.5, Sonnet 5, Opus 4.8, Opus 4.6, "
+                "Sonnet 4.6). One of: low, medium, high, xhigh, max. Empty = API "
+                "default (medium on Opus 5.5, high elsewhere). "
+                "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6. It is only "
+                "sent when thinking is on, so it does not apply to Sonnet 5.5's "
+                "'between tools' setting."
             ),
         )
         THINKING_DISPLAY: str = Field(
@@ -162,8 +169,10 @@ class Pipe:
                 "the reasoning text for lower streaming latency (the Thoughts section "
                 "still appears, with a short note in place of the reasoning). "
                 "Defaults to 'summarized' so it's clear the model thought. "
-                "Note: Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5 and Opus 4.8 "
-                "default to 'omitted' at the API level; this valve overrides that. You are billed for thinking "
+                "Note: Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5.5, Sonnet 5 and "
+                "Opus 4.8 default to 'omitted' at the API level; this valve overrides "
+                "that. On Sonnet 5.5, 'omitted' also hides the short progress notes "
+                "it writes between tool calls. You are billed for thinking "
                 "tokens either way."
             ),
         )
@@ -230,6 +239,7 @@ class Pipe:
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -252,6 +262,7 @@ class Pipe:
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -272,6 +283,7 @@ class Pipe:
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -297,6 +309,7 @@ class Pipe:
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -309,6 +322,7 @@ class Pipe:
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -333,6 +347,7 @@ class Pipe:
             "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5",
+            "claude-sonnet-5-5",
             "claude-sonnet-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
@@ -363,6 +378,12 @@ class Pipe:
             "claude-fable-5",
         }
 
+        # Models that reject `{"type": "disabled"}` but offer a lowest setting
+        # instead, `{"type": "between_tools"}`: thinking only between tool
+        # calls, and plain text when there are no tools. It takes no display,
+        # budget_tokens or block_binding, and is rejected at effort xhigh/max.
+        self.THINKING_BETWEEN_TOOLS_MODELS = {"claude-sonnet-5-5"}
+
         # Models that bind each thinking block to the conversation prefix that
         # produced it. Editing anything before a thinking block (an earlier
         # message, the system prompt, the tool list) invalidates every later
@@ -370,7 +391,11 @@ class Pipe:
         # to a different conversation") on accounts created on or after
         # 2026-08-31. Open WebUI lets users edit and regenerate earlier turns,
         # so the pipe opts into dropping invalidated blocks instead.
-        self.PREFIX_BINDING_MODELS = {"claude-fable-5-1", "claude-opus-5-5"}
+        self.PREFIX_BINDING_MODELS = {
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+        }
 
         # Open WebUI builtin tools that duplicate an Anthropic server tool.
         # With native function calling, Open WebUI offers search_web and
@@ -392,14 +417,16 @@ class Pipe:
 
         # Pricing per million tokens (Input / Output)
         # NOTE: _get_pricing matches by substring, so longer model IDs must
-        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1" and
-        # "claude-opus-5" is a prefix of "claude-opus-5-5".
+        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1",
+        # "claude-opus-5" is a prefix of "claude-opus-5-5" and
+        # "claude-sonnet-5" is a prefix of "claude-sonnet-5-5".
         self.PRICING = {
             # Claude 5 family
             "claude-fable-5-1": {"input": 10.00, "output": 50.00},
             "claude-opus-5-5": {"input": 4.00, "output": 20.00},
             "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
+            "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
             "claude-sonnet-5": {"input": 2.00, "output": 10.00},
             # Claude 4.8 / 4.7 family
             "claude-opus-4-8": {"input": 5.00, "output": 25.00},
@@ -426,6 +453,7 @@ class Pipe:
         # Cache reads cost 0.10x the base input price on every model except
         # Claude Fable 5.1 (0.025x: $0.25 per MTok against a $10 input price)
         # and Claude Opus 5.5 (0.05x: $0.20 per MTok against a $4 input price).
+        # Sonnet 5.5 is the standard 0.10x ($0.20 against a $2 input price).
         self.CACHE_READ_MULTIPLIER = 0.10
         self.REDUCED_CACHE_READ_MODELS = {
             "claude-fable-5-1": 0.025,
@@ -445,6 +473,7 @@ class Pipe:
             #{"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
             #{"id": "claude-opus-5", "name": "claude-opus-5"},
             # {"id": "claude-fable-5", "name": "claude-fable-5"},
+            {"id": "claude-sonnet-5-5", "name": "claude-sonnet-5-5"},
             #{"id": "claude-sonnet-5", "name": "claude-sonnet-5"},
             # {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
             # {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
@@ -532,10 +561,10 @@ class Pipe:
     def _refusal_notice(self, stop_details=None) -> str:
         """Build a user-facing notice for a `stop_reason: "refusal"` response.
 
-        Opus 5.5 / Opus 5 (like Fable 5.1 / Fable 5) run safety classifiers that
-        can decline a request. That comes back as a successful HTTP 200 with an empty or
-        partial content list, so without this the user would just see a blank
-        reply with no explanation.
+        Sonnet 5.5 / Opus 5.5 / Opus 5 (like Fable 5.1 / Fable 5) run safety
+        classifiers that can decline a request. That comes back as a
+        successful HTTP 200 with an empty or partial content list, so without
+        this the user would just see a blank reply with no explanation.
         """
         category = getattr(stop_details, "category", None)
         explanation = getattr(stop_details, "explanation", None)
@@ -676,7 +705,7 @@ class Pipe:
             "input": tool_input if isinstance(tool_input, dict) else {},
         }
 
-    def _convert_messages(self, messages: list) -> list:
+    def _convert_messages(self, messages: list, replay_thinking: bool = True) -> list:
         """Convert Open WebUI's OpenAI-format history to Anthropic messages.
 
         Assistant turns may carry `tool_calls` and `reasoning_details` (the
@@ -685,6 +714,8 @@ class Pipe:
         message. Consecutive messages with the same role are merged, which
         also keeps a turn's tool results together in one user message ahead
         of any follow-up content Open WebUI adds (e.g. images from tools).
+
+        With `replay_thinking=False` no thinking blocks are sent back.
         """
         converted = []
         total_image_size = 0
@@ -704,8 +735,10 @@ class Pipe:
                     tool_result["content"] = input_blocks
                 role, blocks = "user", [tool_result]
             elif role == "assistant":
-                blocks = self._thinking_blocks_from_details(
-                    message.get("reasoning_details")
+                blocks = (
+                    self._thinking_blocks_from_details(message.get("reasoning_details"))
+                    if replay_thinking
+                    else []
                 )
                 if isinstance(content, list):
                     content = "".join(
@@ -714,7 +747,7 @@ class Pipe:
                         if isinstance(item, dict) and item.get("type") == "text"
                     )
                 legacy_thinking, text = self._split_legacy_thinking(content or "")
-                if legacy_thinking and not blocks:
+                if legacy_thinking and replay_thinking and not blocks:
                     blocks.append(legacy_thinking)
                 if text:
                     blocks.append({"type": "text", "text": text})
@@ -848,6 +881,7 @@ class Pipe:
         model_name,
         web_fetch_enabled=False,
         dynamic_web_tools=False,
+        block_binding=False,
     ) -> List[str]:
         """Beta opt-ins this request needs, as `anthropic-beta` values.
 
@@ -856,7 +890,7 @@ class Pipe:
         """
         betas = []
 
-        if model_name in self.PREFIX_BINDING_MODELS:
+        if block_binding:
             # Lets the API drop thinking blocks invalidated by an edited
             # history instead of rejecting the whole request.
             betas.append("thinking-binding-controls-2026-08-01")
@@ -929,6 +963,12 @@ class Pipe:
             else self.valves.ENABLE_THINKING
         )
 
+        # "Thinking off" on these models is the API's lowest thinking setting,
+        # and it can't carry block_binding, so no thinking blocks are replayed.
+        between_tools = (
+            not thinking_enabled and model_name in self.THINKING_BETWEEN_TOOLS_MODELS
+        )
+
         # Pick the web tool versions for this request. The dynamic-filtering
         # versions run their filtering code inside a code execution sandbox that
         # the API provisions itself, so the code execution tool must not also be
@@ -970,7 +1010,9 @@ class Pipe:
 
         system_message, messages = pop_system_message(body["messages"])
 
-        processed_messages = self._convert_messages(messages)
+        processed_messages = self._convert_messages(
+            messages, replay_thinking=not between_tools
+        )
 
         # Add tools for supported models
         tools = []
@@ -1145,6 +1187,12 @@ class Pipe:
                                 f"Warning: max_tokens ({max_tokens}) > 21,333 requires streaming. Forcing streaming mode."
                             )
                             body["stream"] = True
+        elif between_tools:
+            # Sonnet 5.5 rejects `{"type": "disabled"}`; this is the lowest
+            # setting it accepts. Effort is left at the API default (high),
+            # since between_tools is rejected at xhigh and max.
+            params["thinking"] = {"type": "between_tools"}
+            print(f"Using between-tools thinking for {model_name} (thinking is off)")
         elif (
             model_name in self.THINKING_ON_BY_DEFAULT_MODELS
             and model_name not in self.THINKING_ALWAYS_ON_MODELS
@@ -1169,11 +1217,15 @@ class Pipe:
         # invalidated blocks and answer anyway. `{"type": "adaptive"}` is the
         # always-on default on these models, so adding it when thinking is off
         # in the valves changes nothing except giving block_binding a home.
+        # block_binding only works with adaptive thinking.
+        block_binding = False
         if model_name in self.PREFIX_BINDING_MODELS:
             thinking_params = params.setdefault("thinking", {"type": "adaptive"})
-            thinking_params["block_binding"] = {
-                "prefix_mismatch_behavior": "drop_block"
-            }
+            if thinking_params["type"] == "adaptive":
+                thinking_params["block_binding"] = {
+                    "prefix_mismatch_behavior": "drop_block"
+                }
+                block_binding = True
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -1227,6 +1279,7 @@ class Pipe:
             model_name,
             web_fetch_enabled=web_fetch_enabled,
             dynamic_web_tools=use_dynamic_web_tools,
+            block_binding=block_binding,
         )
         if beta_headers:
             params["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
@@ -1265,10 +1318,11 @@ class Pipe:
             self.show_code_execution = self._code_execution_declared(params)
             # Whether thinking blocks will arrive without readable text:
             # display "omitted" is the API default wherever the pipe doesn't set
-            # display itself, and manual (budget) thinking is always summarized.
+            # display itself. Manual (budget) thinking is always summarized, and
+            # between-tools thinking returns its progress notes with their text.
             thinking_config = params.get("thinking") or {}
             hide_thinking_text = (
-                thinking_config.get("type") != "enabled"
+                thinking_config.get("type") not in ("enabled", "between_tools")
                 and thinking_config.get("display", "omitted") == "omitted"
             )
             with self.client.messages.stream(**params) as stream:

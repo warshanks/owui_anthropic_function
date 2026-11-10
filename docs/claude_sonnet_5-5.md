@@ -18,13 +18,13 @@ Claude Sonnet 5.5 supports a **1M token context window** (the default *and* the 
 
 ## Pricing
 
-Unchanged from Sonnet 5:
+The same as Sonnet 5, except for cache reads:
 
 | | Input | Output | 5m cache write | 1h cache write | Cache hit |
 |:--|:--|:--|:--|:--|:--|
-| Claude Sonnet 5.5 | $2 / MTok | $10 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok |
+| Claude Sonnet 5.5 | $2 / MTok | $10 / MTok | $2.50 / MTok | $4 / MTok | $0.10 / MTok |
 
-Cache hits and refreshes cost the standard **0.1x** the base input price, so the pipe's cost tracking needs no reduced multiplier for this model (unlike Opus 5.5 and Fable 5.1). Batch pricing is $1 / $5 per MTok. Sonnet 5.5 is not offered in fast mode, which this pipe doesn't use anyway.
+Cache hits and refreshes cost **0.05x** the base input price, the same multiplier as Opus 5.5 (Sonnet 5 uses the standard 0.1x, $0.20 / MTok). The pipe's cost tracking applies the reduced multiplier for `claude-sonnet-5-5`; versions before 0.21.0 billed its cache hits at 0.1x. Batch pricing is $1 / $5 per MTok. Sonnet 5.5 is not offered in fast mode, so the pipe's `FAST_MODE` valve has no effect on it.
 
 The minimum cacheable prompt is 512 tokens (1,024 on Sonnet 5). Prompts below it are processed normally without caching.
 
@@ -60,7 +60,7 @@ The API then drops invalidated blocks (unbilled) and answers the request instead
 
 `block_binding` works only with adaptive thinking, and `between_tools` rejects it. So in `between_tools` mode the pipe doesn't replay thinking blocks at all: it strips them from the history it sends, following the API docs' advice to "strip the thinking blocks from the edited turn on". The pipe can't tell where an edit happened, so it strips them everywhere. An edited or regenerated chat can then never trip the prefix check, at the cost of the model not seeing its own earlier progress notes on later requests (they stay visible in Open WebUI's Thoughts section).
 
-Model binding: Sonnet 5.5 reads thinking blocks from Sonnet 5, Opus 4.8, Haiku 4.5 and earlier models, but not from Opus 5, Opus 5.5, or any Fable or Mythos model. No other model reads Sonnet 5.5's blocks, so switching a chat from Sonnet 5.5 to another model continues without the earlier reasoning. The API drops what the target model can't read, and the request still succeeds. Blocks are also tied to the account that produced them.
+Model binding: Sonnet 5.5 reads thinking blocks from Haiku 5.5, Sonnet 5, Opus 4.8, Haiku 4.5 and earlier models, but not from Opus 5, Opus 5.5, or any Fable or Mythos model. On the Claude API only Opus 5.5 and Fable 5.2 (and Mythos 5.2) read Sonnet 5.5's blocks, so switching a chat from Sonnet 5.5 to any other model continues without the earlier reasoning. The API drops what the target model can't read, and the request still succeeds. Blocks are also tied to the account that produced them.
 
 ## Forced tool use is rejected
 

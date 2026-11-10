@@ -14,11 +14,12 @@ The following table shows pricing for all Claude models across different usage t
 
 | Model             | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
 |-------------------|-------------------|-----------------|-----------------|----------------------|---------------|
+| Claude Fable 5.2  | $8 / MTok         | $10 / MTok      | $16 / MTok      | $0.20 / MTok<sup>1</sup> | $40 / MTok    |
 | Claude Fable 5.1  | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $0.25 / MTok<sup>1</sup> | $50 / MTok    |
 | Claude Fable 5    | $10 / MTok        | $12.50 / MTok   | $20 / MTok      | $1 / MTok    | $50 / MTok    |
 | Claude Opus 5.5   | $4 / MTok         | $5 / MTok       | $8 / MTok       | $0.20 / MTok<sup>2</sup> | $20 / MTok    |
 | Claude Opus 5     | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
-| Claude Sonnet 5.5 | $2 / MTok         | $2.50 / MTok    | $4 / MTok       | $0.20 / MTok | $10 / MTok    |
+| Claude Sonnet 5.5 | $2 / MTok         | $2.50 / MTok    | $4 / MTok       | $0.10 / MTok<sup>2</sup> | $10 / MTok    |
 | Claude Sonnet 5<sup>3</sup> | $2 / MTok | $2.50 / MTok    | $4 / MTok       | $0.20 / MTok | $10 / MTok    |
 | Claude Opus 4.8   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
 | Claude Opus 4.7   | $5 / MTok         | $6.25 / MTok    | $10 / MTok      | $0.50 / MTok | $25 / MTok    |
@@ -29,8 +30,9 @@ The following table shows pricing for all Claude models across different usage t
 | Claude Sonnet 4.6   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 4.5   | $3 / MTok         | $3.75 / MTok    | $6 / MTok       | $0.30 / MTok | $15 / MTok    |
 | Claude Sonnet 4 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+| Claude Haiku 5.5 (prompts up to 100,000 tokens)<sup>4</sup> | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 / MTok | $0.50 / MTok |
+| Claude Haiku 5.5 (prompts over 100,000 tokens)<sup>4</sup>  | $0.50 / MTok | $0.625 / MTok | $1 / MTok    | $0.05 / MTok | $2.50 / MTok |
 | Claude Haiku 4.5  | $1 / MTok         | $1.25 / MTok    | $2 / MTok       | $0.10 / MTok | $5 / MTok     |
-| Claude Haiku 3.5 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $0.80 / MTok | $1 / MTok | $1.60 / MTok | $0.08 / MTok | $4 / MTok |
 
 <Note>
 MTok = Million tokens. The "Base Input Tokens" column shows standard input pricing, "Cache Writes" and "Cache Hits" are specific to [prompt caching](/docs/en/build-with-claude/prompt-caching), and "Output Tokens" shows output pricing. Prompt caching offers both 5-minute (default) and 1-hour cache durations to optimize costs for different use cases.
@@ -38,15 +40,17 @@ MTok = Million tokens. The "Base Input Tokens" column shows standard input prici
 The table above reflects the following pricing multipliers for prompt caching:
 - 5-minute cache write tokens are 1.25 times the base input tokens price
 - 1-hour cache write tokens are 2 times the base input tokens price
-- Cache read tokens are 0.1 times the base input tokens price (0.025x on Claude Fable 5.1, 0.05x on Claude Opus 5.5)
+- Cache read tokens are 0.1 times the base input tokens price (0.025x on Claude Fable 5.2 and 5.1, 0.05x on Claude Opus 5.5 and Claude Sonnet 5.5)
 
-<sup>1</sup> Cache hits and refreshes on Claude Fable 5.1 (and Claude Mythos 5.1) are priced at 0.025 times the base input price.
+<sup>1</sup> Cache hits and refreshes on Claude Fable 5.2 and Claude Fable 5.1 (and Claude Mythos 5.2 / 5.1) are priced at 0.025 times the base input price.
 
-<sup>2</sup> Cache hits and refreshes on Claude Opus 5.5 are priced at 0.05 times the base input price. All other models use the standard 0.1x multiplier.
+<sup>2</sup> Cache hits and refreshes on Claude Opus 5.5 and Claude Sonnet 5.5 are priced at 0.05 times the base input price. All other models use the standard 0.1x multiplier.
 
 <sup>3</sup> The $2 / $10 Claude Sonnet 5 price, announced at launch as introductory pricing through August 31, 2026, is now the standard price; the scheduled increase to $3 / $15 will not occur.
 
-Claude Sonnet 3.7, Claude Opus 3, and Claude Haiku 3 are retired and no longer listed. Claude Mythos 5.1 / Mythos 5 (limited availability, Project Glasswing) are priced the same as Claude Fable 5.1 / Fable 5.
+<sup>4</sup> Claude Haiku 5.5 is priced by prompt length. A request whose prompt is over 100,000 tokens pays the higher prices for the whole request, output included. The prompt length counts all input tokens, including cache reads and cache writes. Each request is priced on its own.
+
+Claude Sonnet 3.7, Claude Haiku 3.5, Claude Opus 3, and Claude Haiku 3 are retired and no longer listed. Claude Mythos 5.2 / 5.1 / 5 (limited availability, verified organizations only) are priced the same as Claude Fable 5.2 / 5.1 / 5.
 </Note>
 
 ## Third-party platform pricing
@@ -80,6 +84,7 @@ The Batch API allows asynchronous processing of large volumes of requests with a
 
 | Model             | Batch input      | Batch output    |
 |-------------------|------------------|-----------------|
+| Claude Fable 5.2    | $4 / MTok        | $20 / MTok      |
 | Claude Fable 5.1    | $5 / MTok        | $25 / MTok      |
 | Claude Fable 5      | $5 / MTok        | $25 / MTok      |
 | Claude Opus 5.5     | $2 / MTok        | $10 / MTok      |
@@ -95,21 +100,25 @@ The Batch API allows asynchronous processing of large volumes of requests with a
 | Claude Sonnet 4.6   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 4.5   | $1.50 / MTok     | $7.50 / MTok    |
 | Claude Sonnet 4 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $1.50 / MTok | $7.50 / MTok |
+| Claude Haiku 5.5 (prompts up to 100,000 tokens) | $0.05 / MTok | $0.25 / MTok |
+| Claude Haiku 5.5 (prompts over 100,000 tokens)  | $0.25 / MTok | $1.25 / MTok |
 | Claude Haiku 4.5  | $0.50 / MTok     | $2.50 / MTok    |
-| Claude Haiku 3.5 ([retired, except on Bedrock and Google Cloud](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $0.40 / MTok | $2 / MTok |
 
 For more information about batch processing, see our [batch processing documentation](/docs/en/build-with-claude/batch-processing).
 
 ### Long context pricing
 
-Claude 4.6 and later models include the full 1M token context window at standard pricing (a 900K-token request is billed at the same per-token rate as a 9K-token request). Prompt caching and batch discounts apply at standard rates across the full context window.
+Claude 4.6 and later models (except Claude Haiku 5.5) include the full 1M token context window at standard pricing (a 900K-token request is billed at the same per-token rate as a 9K-token request). Prompt caching and batch discounts apply at standard rates across the full context window.
+
+Claude Haiku 5.5 is priced by prompt length: a request whose prompt is over 100,000 tokens pays the higher prices in the table above. The prompt length counts all input tokens, including cache reads and cache writes, so a request over the threshold pays the higher prices even when part of its prompt is a cache hit. Earlier requests keep the prices they were billed at.
 
 ### Fast mode pricing
 
-Fast mode (research preview, Claude API only; not used by this pipe) runs Claude Opus 5.5, Claude Opus 5, and Claude Opus 4.8 with significantly faster output at premium pricing:
+Fast mode runs Claude Fable 5.2 and Claude Opus 5.5 with up to 2.5x faster output at premium pricing; on Claude Opus 5 and Claude Opus 4.8 it is a research preview behind a beta header. This pipe uses it on Claude Opus 5.5 and Claude Fable 5.2 when the `FAST_MODE` valve is on.
 
 | Model                           | Input      | Output     |
 |---------------------------------|------------|------------|
+| Claude Fable 5.2                | $16 / MTok | $80 / MTok |
 | Claude Opus 5.5                 | $8 / MTok  | $40 / MTok |
 | Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |
 

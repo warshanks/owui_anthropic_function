@@ -24,7 +24,9 @@ Claude Opus 5.5 supports a **1M token context window** (the default *and* the ma
 |:--|:--|:--|:--|:--|:--|
 | Claude Opus 5.5 | $4 / MTok | $20 / MTok | $5 / MTok | $8 / MTok | $0.20 / MTok |
 
-Cache hits and refreshes cost **0.05x** the base input price on this model, against 0.1x on most models (0.025x on Fable 5.1). The pipe's cost tracking applies the reduced multiplier for `claude-opus-5-5`. Batch pricing is $2 / $10 per MTok, and fast mode (not used by this pipe) is $8 / $40.
+Cache hits and refreshes cost **0.05x** the base input price on this model (as on Sonnet 5.5), against 0.1x on most models (0.025x on Fable 5.2 and 5.1). The pipe's cost tracking applies the reduced multiplier for `claude-opus-5-5`. Batch pricing is $2 / $10 per MTok.
+
+Fast mode is $8 / $40 per MTok, with no beta header needed. Since version 0.21.0 the pipe sends `speed: "fast"` on Opus 5.5 requests when the `FAST_MODE` valve is on, and falls back to standard speed if fast mode is out of capacity. See [What's new in Claude Fable 5.2](claude_fable_5-2.md#fast-mode) for details.
 
 Web search is billed at $10 per 1,000 searches. Code execution is free when used with web search or web fetch in the same request.
 

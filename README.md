@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.21.0-blue)
+![Version](https://img.shields.io/badge/version-0.21.2-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -75,7 +75,7 @@ Enable tools for a model or chat as usual (workspace tools, MCP servers, tool se
 
 Tool calls are only handed over when Claude's turn actually ended to call them, never when a reply was cut off by `MAX_TOKENS` or a safety refusal. Tool names with characters the API doesn't accept (common with MCP servers) are rewritten to underscores for the API and mapped back for Open WebUI.
 
-When the web search, URL context or code interpreter toggle is on, the pipe uses Anthropic's own server tool and drops Open WebUI's equivalent builtin (`search_web`, `fetch_url` or `execute_code`) so Claude isn't offered two tools for the same job.
+When the web search, URL context or code interpreter toggle is on, the pipe uses Anthropic's own server tool and drops Open WebUI's equivalent builtin (`search_web`, `fetch_url` or `execute_code`) so Claude isn't offered two tools for the same job. The web search toggle turns on web fetch as well, so Claude can still read pages a user links to once Open WebUI's `fetch_url` is dropped.
 
 In **legacy** function calling, Open WebUI resolves tools itself before the pipe runs and injects the results into the prompt, so no tools are sent to Claude.
 
@@ -100,10 +100,10 @@ Off by default. With the `FAST_MODE` valve on, requests to Claude Opus 5.5 and C
 ### Web Search
 Claude can perform web searches to fetch up-to-date information when enabled via the UI's web search toggle.
 
-On Claude 4.6 and later models (Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.7/4.6, Sonnet 4.6) the pipe sends `web_search_20260318` / `web_fetch_20260318`, which filter results with code before they enter the context window. That filtering runs in a sandbox the API provisions itself, so it can't be combined with an explicitly declared code execution tool: if you also turn on the code interpreter, the request falls back to the basic `web_search_20250305` / `web_fetch_20250910` versions. Older models always use the basic versions. The filtering code is never rendered into the chat — code execution blocks are only shown when you enabled code execution yourself.
+On Claude 4.6 and later models (Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5, Opus 4.8/4.7/4.6, Sonnet 4.6) the pipe sends `web_search_20260318` / `web_fetch_20260318`, which filter results with code before they enter the context window. That filtering runs in a sandbox the API provisions itself, or in the code execution tool's container when the code interpreter is on too (the API accepts `code_execution_20260120` or later alongside them, and code execution is free in those requests). Older models use the basic `web_search_20250305` / `web_fetch_20250910` versions. Claude reads its code's filtered output rather than the raw results, so these answers name their sources in the text instead of filling Open WebUI's Sources list. The filtering code is only rendered into the chat when you turned on the code interpreter yourself.
 
 ### Web Fetch
-When enabled via the URL context toggle in the UI, Claude can fetch and analyze content from specific URLs. This is useful for reading documentation, analyzing web pages, or extracting information from specific websites.
+When turned on by the web search toggle, or on its own by the URL context toggle in the UI, Claude can fetch and analyze content from specific URLs. This is useful for reading documentation, analyzing web pages, or extracting information from specific websites.
 
 Uses [suurt8ll's gemini_url_context_toggle filter](https://github.com/suurt8ll/open_webui_functions/blob/master/plugins/filters/gemini_url_context_toggle.py) to enable in the UI.
 

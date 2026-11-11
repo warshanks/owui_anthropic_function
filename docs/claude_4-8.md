@@ -73,7 +73,7 @@ All tools are generally available and require **no beta header** on Opus 4.8:
 - **Web fetch** — `web_fetch_20260318` (dynamic filtering) / `web_fetch_20250910` (basic)
 - **Code execution** — `code_execution_20260521` / `code_execution_20260120` / `code_execution_20250825` (Bash + file operations; every supported model accepts all three)
 
-Since v0.16.0 this pipe sends the dynamic-filtering web tool versions on Opus 4.8 (and every other Claude 4.6+ model), falling back to the basic versions when the user also enables code execution in the same request. Dynamic filtering runs inside a code execution sandbox the API provisions on its own, so the two must not be declared together — see [What's new in Claude Opus 5](claude_opus_5.md) for the full rationale. Code execution is free when bundled with a web tool.
+Since v0.16.0 this pipe sends the dynamic-filtering web tool versions on Opus 4.8 (and every other Claude 4.6+ model), falling back to the basic versions when the user also enables code execution in the same request. Dynamic filtering runs inside a code execution sandbox the API provisions on its own, so the two must not be declared together — see [What's new in Claude Opus 5](claude_opus_5.md) for the full rationale. Code execution is free when bundled with a web tool. Since v0.21.2 the pipe keeps the dynamic-filtering versions when the user also turns on Open WebUI's code interpreter: the API accepts `code_execution_20260120` or later alongside them and runs the filtering in that tool's container.
 
 ## Sampling parameters
 

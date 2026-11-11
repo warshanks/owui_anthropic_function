@@ -64,7 +64,7 @@ Unchanged from Fable 5, and all supported:
 - **Web fetch** — `web_fetch_20260318` with dynamic filtering
 - **Code execution** — `code_execution_20260521`
 
-Dynamic filtering runs inside a code execution sandbox the API provisions itself, so the pipe still falls back to the basic `web_search_20250305` / `web_fetch_20250910` versions when the user turns on Open WebUI's code interpreter.
+Since v0.21.2 the pipe keeps the dynamic-filtering versions when the user also turns on Open WebUI's code interpreter: the API accepts `code_execution_20260120` or later alongside them and runs the filtering in that tool's container.
 
 ## Refusals
 

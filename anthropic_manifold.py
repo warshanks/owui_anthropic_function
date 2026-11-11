@@ -3,14 +3,16 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.21.0
+version: 0.21.2
 license: MIT
 
 This pipe provides access to Anthropic's Claude models (Claude Fable 5.2,
 Opus 5.5, Sonnet 5.5, Haiku 5.5 and earlier) with support for:
 - Open WebUI tools (workspace tools, MCP servers, tool servers and builtins)
   through native function calling
-- Web search capabilities (dynamic result filtering on Claude 4.6+ models)
+- Web search capabilities (dynamic result filtering on Claude 4.6+ models); the
+  web search toggle switches on Claude's own web search and web fetch in place
+  of Open WebUI's search_web and fetch_url
 - Web fetch capabilities (dynamic content filtering on Claude 4.6+ models)
 - Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
@@ -252,6 +254,8 @@ class Pipe:
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+            # Every active model. Retired models (Opus 4.1 / 4, Sonnet 4 and
+            # the Claude 3.x models) are left out: requests to them fail.
             "web_search": {
                 "claude-fable-5-2",
                 "claude-fable-5-1",
@@ -266,17 +270,11 @@ class Pipe:
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
-                "claude-opus-4-1-20250805",
-                "claude-opus-4-20250514",
                 "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4-20250514",
                 "claude-haiku-4-5-20251001",
-                "claude-3-7-sonnet-20250219",
-                "claude-3-7-sonnet-latest",
-                "claude-3-5-sonnet-latest",
-                "claude-3-5-haiku-latest",
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
+            # Same models as web search.
             "web_fetch": {
                 "claude-fable-5-2",
                 "claude-fable-5-1",
@@ -291,13 +289,8 @@ class Pipe:
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4-20250514",
-                "claude-3-7-sonnet-20250219",
                 "claude-haiku-4-5-20251001",
-                "claude-3-5-haiku-latest",
                 "claude-opus-4-5-20251101",
-                "claude-opus-4-1-20250805",
-                "claude-opus-4-20250514",
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
@@ -960,33 +953,19 @@ class Pipe:
 
             self.client = anthropic.Anthropic(api_key=api_key)
 
-    def _beta_headers(
-        self,
-        model_name,
-        web_fetch_enabled=False,
-        dynamic_web_tools=False,
-        block_binding=False,
-    ) -> List[str]:
+    def _beta_headers(self, params) -> List[str]:
         """Beta opt-ins this request needs, as `anthropic-beta` values.
 
-        Code execution no longer needs one: every current tool version
-        (`code_execution_20250825` through `code_execution_20260521`) is GA.
+        The server tools no longer need one: every current version of web
+        search, web fetch (including the basic `web_fetch_20250910`, which
+        used to need `web-fetch-2025-09-10`) and code execution is GA.
         """
         betas = []
 
-        if block_binding:
+        if "block_binding" in (params.get("thinking") or {}):
             # Lets the API drop thinking blocks invalidated by an edited
             # history instead of rejecting the whole request.
             betas.append("thinking-binding-controls-2026-08-01")
-
-        if (
-            web_fetch_enabled
-            and not dynamic_web_tools
-            and self.supports_capability(model_name, "web_fetch")
-        ):
-            # Only the basic web_fetch_20250910 version needs this beta
-            # header; the dynamic-filtering versions are GA.
-            betas.append("web-fetch-2025-09-10")
 
         return betas
 
@@ -1079,14 +1058,22 @@ class Pipe:
         # Check if code execution is enabled in the UI
         code_execution_enabled = bool(features.get("code_interpreter"))
 
-        # Check if web search is enabled in the UI
+        # Check if web search is enabled in the UI. The toggle switches on
+        # Claude's own web tools in place of Open WebUI's: with native function
+        # calling, Open WebUI answers it by offering its builtin search_web and
+        # fetch_url, and both are dropped below once the Anthropic versions are
+        # declared.
         web_search_enabled = bool(features.get("web_search"))
 
         # Check if web fetch is enabled via the url_context toggle filter, which
-        # shows up in filter_ids and sets "url_context" in features
-        web_fetch_enabled = "gemini_url_context_toggle" in (
-            metadata.get("filter_ids") or []
-        ) or bool(features.get("url_context"))
+        # shows up in filter_ids and sets "url_context" in features. The web
+        # search toggle turns it on too, so replacing Open WebUI's fetch_url
+        # doesn't take away reading the pages a user links to.
+        web_fetch_enabled = (
+            web_search_enabled
+            or "gemini_url_context_toggle" in (metadata.get("filter_ids") or [])
+            or bool(features.get("url_context"))
+        )
 
         # Check if thinking is enabled in valves
         thinking_enabled = (
@@ -1113,18 +1100,15 @@ class Pipe:
         )
 
         # Pick the web tool versions for this request. The dynamic-filtering
-        # versions run their filtering code inside a code execution sandbox that
-        # the API provisions itself, so the code execution tool must not also be
-        # declared in the same request — a second execution environment confuses
-        # the model, and the pipe declares an older code execution version than
-        # dynamic filtering calls into. When the user has the code interpreter
-        # toggled on, their code execution wins and the basic web tools are used.
-        code_execution_requested = code_execution_enabled and self.supports_capability(
-            model_name, "code_execution"
-        )
-        use_dynamic_web_tools = (
-            self.supports_capability(model_name, "dynamic_web_tools")
-            and not code_execution_requested
+        # versions run their filtering code in a sandbox the API provisions
+        # itself, or in the code execution tool's container when the code
+        # interpreter is on too: the API accepts code_execution_20260120 or
+        # later alongside them, and code execution is free in those requests.
+        # Claude reads its code's filtered output rather than the raw results,
+        # so these answers name their sources in the text instead of returning
+        # citation blocks (only the basic versions fill Open WebUI's Sources).
+        use_dynamic_web_tools = self.supports_capability(
+            model_name, "dynamic_web_tools"
         )
 
         self.init_client(user_valves, __event_emitter__)
@@ -1179,10 +1163,11 @@ class Pipe:
             self.supports_capability(model_name, "code_execution")
             and code_execution_enabled
         ):
-            # code_execution_20260521: same runtime as 20260120, and the
-            # version the current dynamic-filtering web tools call into.
-            # Every supported model accepts it and none of the current
-            # versions needs a beta header.
+            # code_execution_20260521: same runtime as 20260120, the oldest
+            # version the API accepts alongside the dynamic-filtering web
+            # tools, which then run in this tool's container. Every supported
+            # model accepts it and none of the current versions needs a beta
+            # header.
             tools.append({"type": "code_execution_20260521", "name": "code_execution"})
 
         # Add web fetch tool if supported by model and enabled
@@ -1364,14 +1349,12 @@ class Pipe:
         # in the valves changes nothing except giving block_binding a home.
         # block_binding only works with adaptive thinking (it's a 400 alongside
         # Sonnet 5.5's between_tools or Haiku 5.5's disabled).
-        block_binding = False
         if model_name in self.PREFIX_BINDING_MODELS:
             thinking_params = params.setdefault("thinking", {"type": "adaptive"})
             if thinking_params["type"] == "adaptive":
                 thinking_params["block_binding"] = {
                     "prefix_mismatch_behavior": "drop_block"
                 }
-                block_binding = True
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -1428,12 +1411,7 @@ class Pipe:
         if tools:
             params["tools"] = tools
 
-        beta_headers = self._beta_headers(
-            model_name,
-            web_fetch_enabled=web_fetch_enabled,
-            dynamic_web_tools=use_dynamic_web_tools,
-            block_binding=block_binding,
-        )
+        beta_headers = self._beta_headers(params)
         if beta_headers:
             params["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
 
@@ -1541,6 +1519,16 @@ class Pipe:
                             if hasattr(event, "usage"):
                                 output_tokens = event.usage.output_tokens
                                 speed = getattr(event.usage, "speed", None) or speed
+                                # The billed search count (failed searches
+                                # aren't billed) replaces the running count
+                                # of search calls seen in the stream
+                                server_tool_use = getattr(
+                                    event.usage, "server_tool_use", None
+                                )
+                                if server_tool_use is not None:
+                                    web_search_count = (
+                                        server_tool_use.web_search_requests or 0
+                                    )
                             # A safety classifier can decline the request
                             # mid-stream (or before any output) — the stream
                             # ends normally, so surface it explicitly.
@@ -1900,9 +1888,9 @@ class Pipe:
                                             ),
                                         }
 
-                                    elif hasattr(
-                                        citation, "url"
-                                    ):  # Web search/fetch citation (inferred structure)
+                                    elif citation.type == "web_search_result_location":
+                                        # Web search (web fetch cites with
+                                        # char_location / page_location)
                                         source["source"]["type"] = "web_search_result"
                                         source["source"]["url"] = getattr(
                                             citation, "url", ""
@@ -2155,9 +2143,9 @@ class Pipe:
                                         ),
                                     }
 
-                                elif hasattr(
-                                    citation, "url"
-                                ):  # Web search/fetch citation (inferred structure)
+                                elif citation.type == "web_search_result_location":
+                                    # Web search (web fetch cites with
+                                    # char_location / page_location)
                                     source["source"]["type"] = "web_search_result"
                                     source["source"]["url"] = getattr(
                                         citation, "url", ""
@@ -2279,20 +2267,17 @@ class Pipe:
                     )
 
                     # Try to get web search count from usage if available, otherwise count properties could be used
-                    # but simpler to rely on parsing content blocks if we tracked them.
-                    # As a fallback, let's recount from content blocks for consistency or check usage
-                    web_search_count = 0
-                    if hasattr(response, "usage") and isinstance(response.usage, dict):
-                        # check dict
-                        pass
-
-                    # Manual count from content blocks is reliable for intent
-                    for block in response.content:
-                        if (
-                            block.type == "server_tool_use"
+                    # billed), or the search calls in the reply without it
+                    server_tool_use = getattr(response.usage, "server_tool_use", None)
+                    if server_tool_use is not None:
+                        web_search_count = server_tool_use.web_search_requests or 0
+                    else:
+                        web_search_count = sum(
+                            1
+                            for block in response.content
+                            if block.type == "server_tool_use"
                             and block.name == "web_search"
-                        ):
-                            web_search_count += 1
+                        )
 
                     speed = getattr(
                         response.usage, "speed", None

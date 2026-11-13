@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.21.2
+version: 0.21.3
 license: MIT
 
 This pipe provides access to Anthropic's Claude models (Claude Fable 5.2,
@@ -21,6 +21,7 @@ Opus 5.5, Sonnet 5.5, Haiku 5.5 and earlier) with support for:
 - Automatic prompt caching for multi-turn conversations (large input cost savings)
 - Image processing and analysis
 - Centralized model capability management
+- Per-user valves (including a user's own API key) layered over the admin's
 - Proper handling of redacted thinking and streaming requirements
 - Safety-classifier refusals surfaced instead of returning an empty response
 - Preserved-thinking prefix binding handled on Claude Fable 5.2, Claude Fable 5.1,
@@ -39,7 +40,7 @@ import re
 import time
 import requests
 from typing import List, Union, Generator, Iterator, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from open_webui.utils.misc import pop_system_message
 import anthropic
 import asyncio
@@ -131,10 +132,16 @@ class EventEmitter:
 
 class Pipe:
     class Valves(BaseModel):
-        ANTHROPIC_API_KEY: str = Field(default="")
+        ANTHROPIC_API_KEY: str = Field(
+            default="", json_schema_extra={"input": {"type": "password"}}
+        )
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
-            description="Whether to require user's own API key (applies to admins too).",
+            description=(
+                "Require every user (admins too) to set their own ANTHROPIC_API_KEY "
+                "in this function's user valves. The admin key above is then never "
+                "used, and a user without a key gets a message asking for one."
+            ),
         )
         THINKING_BUDGET: int = Field(
             default=8192,
@@ -215,14 +222,51 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
-        ANTHROPIC_API_KEY: str = Field(default="")
-        THINKING_BUDGET: int = Field(default=8192)
-        MAX_TOKENS: int = Field(default=10240)
-        ENABLE_THINKING: bool = Field(default=True)
-        EFFORT: str = Field(default="")
-        THINKING_DISPLAY: str = Field(default="")
-        ENABLE_PROMPT_CACHING: bool = Field(default=True)
-        CACHE_TTL: str = Field(default="")
+        """Per-user overrides of the admin valves of the same name.
+
+        A valve the user leaves at "Default" in Open WebUI uses the admin's
+        setting. The defaults below only pre-fill the field when the user
+        switches it to "Custom"; they never override the admin.
+        """
+
+        ANTHROPIC_API_KEY: str = Field(
+            default="",
+            description="Your own Anthropic API key, used instead of the admin's.",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        THINKING_BUDGET: int = Field(
+            default=8192,
+            description="Thinking token budget on budget-based models (Opus 4.5 and older).",
+        )
+        MAX_TOKENS: int = Field(
+            default=10240,
+            description="Maximum tokens to generate, thinking included.",
+        )
+        ENABLE_THINKING: bool = Field(
+            default=True, description="Enable extended thinking (see the admin valve)."
+        )
+        EFFORT: str = Field(
+            default="", description="low, medium, high, xhigh or max (see the admin valve)."
+        )
+        THINKING_DISPLAY: str = Field(
+            default="", description="summarized or omitted (see the admin valve)."
+        )
+        ENABLE_PROMPT_CACHING: bool = Field(
+            default=True, description="Enable automatic prompt caching."
+        )
+        CACHE_TTL: str = Field(default="", description="Prompt cache lifetime: 5m or 1h.")
+
+        @model_validator(mode="before")
+        @classmethod
+        def _drop_unset(cls, data):
+            # Open WebUI saves a valve left at "Default" as null, and a field
+            # switched to "Custom" but never filled in as "". Validating either
+            # against an int or bool field fails, and Open WebUI then discards
+            # every one of the user's valves. Leaving them out keeps them
+            # unset, so they fall back to the admin's setting (_valve).
+            if isinstance(data, dict):
+                return {k: v for k, v in data.items() if v is not None and v != ""}
+            return data
 
     def __init__(self):
         self.type = "manifold"
@@ -242,14 +286,15 @@ class Pipe:
             )
 
         self.MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB per image
-        self.client = None
+        # Open WebUI shares one Pipe instance between every chat and user, so
+        # the API client (which holds the API key) and the event emitter are
+        # created per request and passed along, never stored on self.
         self.is_thinking = False
         self.is_code_execution = False
         self.code_execution_block_index = None
         # Whether code execution blocks are rendered into the chat (only when
         # the user asked for code execution — see _code_execution_declared).
         self.show_code_execution = True
-        self.event_emitter = None
 
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
@@ -519,10 +564,6 @@ class Pipe:
         # Cost per web search request ($10 per 1,000 searches)
         self.WEB_SEARCH_COST = 0.01
 
-        # Cache write premium over base input price (1.25x for 5m TTL,
-        # 2x for 1h TTL); updated per-request from the CACHE_TTL valve.
-        self.cache_write_multiplier = 1.25
-
     def get_anthropic_models(self):
         return [
             {"id": "claude-opus-5-5", "name": "claude-opus-5-5"},
@@ -594,8 +635,13 @@ class Pipe:
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
         speed: Optional[str] = None,
+        cache_ttl: Optional[str] = None,
     ) -> float:
-        """Calculate total cost for the usage."""
+        """Calculate total cost for the usage.
+
+        `cache_ttl` is the request's cache lifetime: cache writes cost 2x the
+        base input price for "1h" and 1.25x for the default 5 minutes.
+        """
         pricing = self._get_pricing(
             model_name,
             prompt_tokens=input_tokens + cache_creation_tokens + cache_read_tokens,
@@ -605,7 +651,7 @@ class Pipe:
         cache_write_cost = (
             (cache_creation_tokens / 1_000_000)
             * pricing["input"]
-            * self.cache_write_multiplier
+            * (2.0 if cache_ttl == "1h" else 1.25)
         )
         cache_read_cost = (
             (cache_read_tokens / 1_000_000)
@@ -925,33 +971,68 @@ class Pipe:
                 "source": {"type": "url", "url": url},
             }
 
-    def init_client(self, user_valves=None, event_emitter=None):
-        """Initialize the Anthropic client with the appropriate API key.
+    def _user_valves(self, user) -> Optional["Pipe.UserValves"]:
+        """The requesting user's valves.
+
+        Open WebUI passes `__user__` as a dict whose "valves" entry is already
+        a UserValves instance built from that user's saved valves. It is
+        rebuilt here from the fields the user actually set, so a dict (or an
+        instance of the class from before a code reload) works too.
+        """
+        valves = user.get("valves") if isinstance(user, dict) else None
+        if isinstance(valves, BaseModel):
+            valves = valves.model_dump(exclude_unset=True)
+        if not isinstance(valves, dict):
+            return None
+        try:
+            return self.UserValves(**valves)
+        except Exception as e:
+            print(f"Error parsing user valves: {e}")
+            return None
+
+    def _valve(self, user_valves, name: str):
+        """A setting for this request: the user's value if they set one,
+        otherwise the admin's.
+
+        A user valve counts as set only when the user switched it to "Custom"
+        and gave it a value (see UserValves._drop_unset), so the UserValves
+        defaults never override the admin.
+        """
+        if user_valves is not None and name in user_valves.model_fields_set:
+            return getattr(user_valves, name)
+        return getattr(self.valves, name)
+
+    def _api_key(self, user_valves) -> Optional[str]:
+        """The API key for this request, or None if a required user key is missing.
+
+        A user's own key takes precedence. With REQUIRE_USER_API_KEY on, the
+        admin's key is never used.
+        """
+        user_key = user_valves.ANTHROPIC_API_KEY if user_valves is not None else ""
+        if user_key:
+            return user_key
+        if self.valves.REQUIRE_USER_API_KEY:
+            return None
+        return self.valves.ANTHROPIC_API_KEY
+
+    def _make_client(self, api_key: str):
+        """An Anthropic client for one request.
+
+        Open WebUI shares one Pipe instance between users and runs their
+        requests concurrently, so the client (and the API key in it) is never
+        stored on the instance, where another user's request could replace it
+        before this one is sent.
 
         Beta headers are not set here. Which betas a request needs depends on
         the model and the tools enabled for that request, so they are sent per
         request via `extra_headers` (see `_beta_headers`) rather than baked
         into the client's default headers.
         """
-        if event_emitter:
-            self.event_emitter = EventEmitter(event_emitter)
+        return anthropic.Anthropic(api_key=api_key)
 
-        if not self.client:
-            # Use user's API key if provided and allowed
-            api_key = None
-            if (
-                user_valves
-                and hasattr(user_valves, "ANTHROPIC_API_KEY")
-                and user_valves.ANTHROPIC_API_KEY
-            ):
-                api_key = user_valves.ANTHROPIC_API_KEY
-            else:
-                api_key = self.valves.ANTHROPIC_API_KEY
-
-            if not api_key and self.valves.REQUIRE_USER_API_KEY:
-                raise ValueError("API key is required but not provided")
-
-            self.client = anthropic.Anthropic(api_key=api_key)
+    def _cache_ttl(self, params) -> Optional[str]:
+        """The cache lifetime a request asked for ("1h"), for pricing writes."""
+        return ((params.get("extra_body") or {}).get("cache_control") or {}).get("ttl")
 
     def _beta_headers(self, params) -> List[str]:
         """Beta opt-ins this request needs, as `anthropic-beta` values.
@@ -995,26 +1076,26 @@ class Pipe:
         """The speed a request asked for, for when the response omits it."""
         return (params.get("extra_body") or {}).get("speed")
 
-    def _open_stream(self, params):
+    def _open_stream(self, client, params):
         """Open a message stream, falling back to standard speed if needed.
 
         The request is sent when the stream opens, so a fast mode capacity
         error arrives here, before anything has been yielded to the chat.
         """
         try:
-            return self.client.messages.stream(**params).__enter__()
+            return client.messages.stream(**params).__enter__()
         except anthropic.APIStatusError as e:
             if self._drop_fast_mode(params, e):
-                return self.client.messages.stream(**params).__enter__()
+                return client.messages.stream(**params).__enter__()
             raise
 
-    def _create_message(self, params):
+    def _create_message(self, client, params):
         """Non-streaming request, falling back to standard speed if needed."""
         try:
-            return self.client.messages.create(**params)
+            return client.messages.create(**params)
         except anthropic.APIStatusError as e:
             if self._drop_fast_mode(params, e):
-                return self.client.messages.create(**params)
+                return client.messages.create(**params)
             raise
 
     async def pipe(
@@ -1025,20 +1106,21 @@ class Pipe:
         __event_emitter__=None,
         **kwargs,
     ) -> Union[str, Generator, Iterator, AsyncIterator]:
-        # Get user valves if user info is provided
-        user_valves = None
-        if __user__ and hasattr(__user__, "valves") and __user__.valves:
-            # Try to parse user valves
-            try:
-                user_valves = self.UserValves(**__user__.valves.get("anthropic", {}))
-            except Exception as e:
-                print(f"Error parsing user valves: {e}")
+        # The requesting user's overrides of the admin valves (see _valve)
+        user_valves = self._user_valves(__user__)
 
         # Prepare common parameters
         model_name = body["model"][body["model"].find(".") + 1 :]
 
-        # Reset client to ensure correct headers for the model
-        self.client = None
+        api_key = self._api_key(user_valves)
+        if api_key is None:
+            return (
+                "This model needs your own Anthropic API key. Add it as "
+                "ANTHROPIC_API_KEY in this function's valves (the chat's "
+                "Controls panel, under Valves), then send your message again."
+            )
+        client = self._make_client(api_key)
+        event_emitter = EventEmitter(__event_emitter__) if __event_emitter__ else None
 
         # UI toggles. Open WebUI pops `features` off the request body before
         # calling pipes and passes them in __metadata__; the body is only a
@@ -1076,11 +1158,7 @@ class Pipe:
         )
 
         # Check if thinking is enabled in valves
-        thinking_enabled = (
-            user_valves.ENABLE_THINKING
-            if user_valves and hasattr(user_valves, "ENABLE_THINKING")
-            else self.valves.ENABLE_THINKING
-        )
+        thinking_enabled = self._valve(user_valves, "ENABLE_THINKING")
 
         # "Thinking off" on these models is the API's lowest thinking setting
         between_tools = (
@@ -1110,8 +1188,6 @@ class Pipe:
         use_dynamic_web_tools = self.supports_capability(
             model_name, "dynamic_web_tools"
         )
-
-        self.init_client(user_valves, __event_emitter__)
 
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
@@ -1202,13 +1278,11 @@ class Pipe:
         tools = tools if tools else None
 
         # Create the parameters dict for the API call
-        # Get max_tokens from user valves, system valves, or body, in that order of preference
+        # max_tokens from the request body (a model's advanced params), else
+        # the user's valve, else the admin's
         max_tokens = body.get("max_tokens", None)
         if max_tokens is None:
-            if user_valves and hasattr(user_valves, "MAX_TOKENS"):
-                max_tokens = user_valves.MAX_TOKENS
-            else:
-                max_tokens = self.valves.MAX_TOKENS
+            max_tokens = self._valve(user_valves, "MAX_TOKENS")
 
         params = {
             "model": model_name,
@@ -1228,11 +1302,7 @@ class Pipe:
                 # visible in the Thoughts section. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
                 # default to "omitted" (empty thinking text) at the API level, so we
                 # set this explicitly.
-                display = (
-                    user_valves.THINKING_DISPLAY
-                    if user_valves and getattr(user_valves, "THINKING_DISPLAY", "")
-                    else self.valves.THINKING_DISPLAY
-                )
+                display = self._valve(user_valves, "THINKING_DISPLAY")
                 display = (display or "summarized").strip().lower()
                 if display not in ("summarized", "omitted"):
                     print(f"Invalid THINKING_DISPLAY '{display}'; using 'summarized'.")
@@ -1247,11 +1317,7 @@ class Pipe:
 
                 # Optional effort guidance (output_config.effort). Sent via
                 # extra_body so it works regardless of installed SDK version.
-                effort = (
-                    user_valves.EFFORT
-                    if user_valves and getattr(user_valves, "EFFORT", "")
-                    else self.valves.EFFORT
-                )
+                effort = self._valve(user_valves, "EFFORT")
                 effort = (effort or "").strip().lower()
                 if effort:
                     valid_efforts = {"low", "medium", "high", "xhigh", "max"}
@@ -1277,11 +1343,7 @@ class Pipe:
                     body["stream"] = True
             else:
                 # Get thinking budget from user valves or default to system valve
-                thinking_budget = (
-                    user_valves.THINKING_BUDGET
-                    if user_valves and hasattr(user_valves, "THINKING_BUDGET")
-                    else self.valves.THINKING_BUDGET
-                )
+                thinking_budget = self._valve(user_valves, "THINKING_BUDGET")
 
                 # Validate thinking budget according to documentation requirements
                 if thinking_budget > 0:
@@ -1363,22 +1425,13 @@ class Pipe:
         # every request. Prompts below the model's minimum cacheable length
         # are silently processed without caching, so this is always safe to
         # send. Passed via extra_body to work on any installed SDK version.
-        caching_enabled = (
-            user_valves.ENABLE_PROMPT_CACHING
-            if user_valves and hasattr(user_valves, "ENABLE_PROMPT_CACHING")
-            else self.valves.ENABLE_PROMPT_CACHING
-        )
+        caching_enabled = self._valve(user_valves, "ENABLE_PROMPT_CACHING")
         if caching_enabled:
-            cache_ttl = (
-                user_valves.CACHE_TTL
-                if user_valves and getattr(user_valves, "CACHE_TTL", "")
-                else self.valves.CACHE_TTL
-            )
+            cache_ttl = self._valve(user_valves, "CACHE_TTL")
             cache_ttl = (cache_ttl or "5m").strip().lower()
             if cache_ttl not in ("5m", "1h"):
                 print(f"Invalid CACHE_TTL '{cache_ttl}'; using '5m'.")
                 cache_ttl = "5m"
-            self.cache_write_multiplier = 2.0 if cache_ttl == "1h" else 1.25
             cache_control = {"type": "ephemeral"}
             if cache_ttl == "1h":
                 cache_control["ttl"] = "1h"
@@ -1417,11 +1470,15 @@ class Pipe:
 
         try:
             if body.get("stream", False):
-                return self.stream_response_sdk(params, tool_names)
+                return self.stream_response_sdk(
+                    client, params, tool_names, event_emitter
+                )
             else:
                 # Awaited here: Open WebUI awaits pipe() itself but not a
                 # coroutine it returns, which would leave the reply empty
-                return await self.non_stream_response_sdk(params, tool_names)
+                return await self.non_stream_response_sdk(
+                    client, params, tool_names, event_emitter
+                )
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)
@@ -1439,10 +1496,14 @@ class Pipe:
             print(error_msg)
             return error_msg
 
-    async def stream_response_sdk(self, params, tool_names=None):
+    async def stream_response_sdk(
+        self, client, params, tool_names=None, event_emitter=None
+    ):
         """Stream a response to Open WebUI.
 
-        `tool_names` maps API tool names back to Open WebUI tool names.
+        `client` and `event_emitter` belong to this request (see
+        _make_client), and `tool_names` maps API tool names back to Open WebUI
+        tool names.
         """
         tool_names = tool_names or {}
         try:
@@ -1456,7 +1517,7 @@ class Pipe:
                 thinking_config.get("type") not in ("enabled", "between_tools")
                 and thinking_config.get("display", "omitted") == "omitted"
             )
-            with self._open_stream(params) as stream:
+            with self._open_stream(client, params) as stream:
                 # For extended thinking: handle thinking blocks in the stream
                 self.is_thinking = False
                 self.thinking_signature = None
@@ -1821,7 +1882,7 @@ class Pipe:
                         # Handle content block stop for text to emit citations
                         elif event.type == "content_block_stop":
                             # If we have collected citations for this block, emit them
-                            if current_citations and self.event_emitter:
+                            if current_citations and event_emitter:
                                 # Process citations into Open WebUI Source format
                                 sources = []
                                 for citation in current_citations:
@@ -1925,7 +1986,7 @@ class Pipe:
                                     sources.append(source["source"])
 
                                 if sources:
-                                    await self.event_emitter.emit_completion(
+                                    await event_emitter.emit_completion(
                                         sources=sources
                                     )
 
@@ -1960,7 +2021,7 @@ class Pipe:
             total_prompt_tokens = (
                 input_tokens + cache_creation_tokens + cache_read_tokens
             )
-            if self.event_emitter and total_prompt_tokens > 0:
+            if event_emitter and total_prompt_tokens > 0:
                 speed = speed or self._requested_speed(params)
                 total_cost = self._calculate_cost(
                     input_tokens,
@@ -1970,6 +2031,7 @@ class Pipe:
                     cache_creation_tokens,
                     cache_read_tokens,
                     speed=speed,
+                    cache_ttl=self._cache_ttl(params),
                 )
                 completion_time = time.time() - stream_start_time
 
@@ -1986,7 +2048,7 @@ class Pipe:
                 if speed == "fast":
                     usage_data["speed"] = speed
 
-                await self.event_emitter.emit_usage(usage_data)
+                await event_emitter.emit_usage(usage_data)
 
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
@@ -2005,7 +2067,9 @@ class Pipe:
             print(error_msg)
             yield error_msg
 
-    async def non_stream_response_sdk(self, params, tool_names=None):
+    async def non_stream_response_sdk(
+        self, client, params, tool_names=None, event_emitter=None
+    ):
         """Return a complete response as an OpenAI-format chat completion.
 
         Thinking goes in `reasoning_content` / `reasoning_details` and client
@@ -2015,7 +2079,7 @@ class Pipe:
         try:
             start_time = time.time()
             self.show_code_execution = self._code_execution_declared(params)
-            response = self._create_message(params)
+            response = self._create_message(client, params)
 
             # A safety classifier may decline the request: HTTP 200 with
             # stop_reason "refusal" and empty (or partial) content.
@@ -2252,11 +2316,11 @@ class Pipe:
                     elif content_block.type == "web_fetch_tool_result":
                         result_parts.append("Fetched.\n\n")
 
-                if all_citations and self.event_emitter:
-                    await self.event_emitter.emit_completion(sources=all_citations)
+                if all_citations and event_emitter:
+                    await event_emitter.emit_completion(sources=all_citations)
 
                 # Emit usage
-                if self.event_emitter and hasattr(response, "usage"):
+                if event_emitter and hasattr(response, "usage"):
                     input_tokens = response.usage.input_tokens
                     output_tokens = response.usage.output_tokens
                     cache_creation_tokens = (
@@ -2290,6 +2354,7 @@ class Pipe:
                         cache_creation_tokens,
                         cache_read_tokens,
                         speed=speed,
+                        cache_ttl=self._cache_ttl(params),
                     )
                     completion_time = time.time() - start_time
 
@@ -2313,7 +2378,7 @@ class Pipe:
                     if speed == "fast":
                         usage_data["speed"] = speed
 
-                    await self.event_emitter.emit_usage(usage_data)
+                    await event_emitter.emit_usage(usage_data)
 
                 if refusal_notice:
                     result_parts.append(refusal_notice)

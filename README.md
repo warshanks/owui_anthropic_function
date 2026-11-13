@@ -1,6 +1,6 @@
 # Anthropic Manifold Pipe for Open WebUI
 
-![Version](https://img.shields.io/badge/version-0.21.2-blue)
+![Version](https://img.shields.io/badge/version-0.21.3-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 This pipe provides seamless integration with Anthropic's Claude models for Open WebUI, enabling advanced capabilities like web search, secure code execution, and extended thinking.
@@ -22,7 +22,7 @@ This pipe provides seamless integration with Anthropic's Claude models for Open 
 - **Image Processing**: Analyze images with support for both URL and base64 inputs (up to 5MB).
 - **Streaming Support**: Real-time streaming of responses, including thinking blocks and code execution outputs.
 - **Cost Tracking**: Track and display the cost of requests in real-time, including per-model cache-read rates, fast mode prices, and Claude Haiku 5.5's higher rate card for prompts over 100K tokens.
-- **Flexible Configuration**: Manage capabilities globally or per-user via Valves.
+- **Flexible Configuration**: Manage capabilities globally with Valves, and let each user override them, including with their own API key, through User Valves.
 
 ## Supported Models
 
@@ -51,7 +51,11 @@ Claude Opus 4.8 remains available; see [What's new in Claude 4.8](docs/claude_4-
 
 ## Configuration
 
-You can configure the pipe using **Valves**. These can be set globally by the admin or individually by users (if allowed).
+You can configure the pipe using **Valves** (set by the admin in **Admin Panel** -> **Functions**) and **User Valves** (set by each user in a chat's **Controls** panel, under **Valves**; admins can hide that panel from users with the chat valves permission).
+
+User valves override the admin valves of the same name for that user only: `ANTHROPIC_API_KEY`, `MAX_TOKENS`, `ENABLE_THINKING`, `EFFORT`, `THINKING_DISPLAY`, `THINKING_BUDGET`, `ENABLE_PROMPT_CACHING` and `CACHE_TTL`. A user valve left at **Default** uses the admin's setting; only a valve switched to **Custom** overrides it. A `max_tokens` set in a model's advanced parameters takes precedence over both.
+
+A user's own `ANTHROPIC_API_KEY` is used instead of the admin's key. With the admin valve `REQUIRE_USER_API_KEY` on, the admin's key is never used: a user without their own key gets a message asking them to add one. `FAST_MODE` and `REQUIRE_USER_API_KEY` are admin-only.
 
 ## Installation
 

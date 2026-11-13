@@ -3,13 +3,16 @@ title: Anthropic Manifold Pipe
 authors: warshanks
 author_url: https://github.com/warshanks
 funding_url: https://github.com/warshanks
-version: 0.20.0
+version: 0.21.3
 license: MIT
 
-This pipe provides access to Anthropic's Claude models with support for:
+This pipe provides access to Anthropic's Claude models (Claude Fable 5.2,
+Opus 5.5, Sonnet 5.5, Haiku 5.5 and earlier) with support for:
 - Open WebUI tools (workspace tools, MCP servers, tool servers and builtins)
   through native function calling
-- Web search capabilities (dynamic result filtering on Claude 4.6+ models)
+- Web search capabilities (dynamic result filtering on Claude 4.6+ models); the
+  web search toggle switches on Claude's own web search and web fetch in place
+  of Open WebUI's search_web and fetch_url
 - Web fetch capabilities (dynamic content filtering on Claude 4.6+ models)
 - Code execution in Anthropic's secure sandbox environment
 - Extended thinking capabilities with proper validation
@@ -18,12 +21,17 @@ This pipe provides access to Anthropic's Claude models with support for:
 - Automatic prompt caching for multi-turn conversations (large input cost savings)
 - Image processing and analysis
 - Centralized model capability management
+- Per-user valves (including a user's own API key) layered over the admin's
 - Proper handling of redacted thinking and streaming requirements
 - Safety-classifier refusals surfaced instead of returning an empty response
-- Preserved-thinking prefix binding handled on Claude Fable 5.1, Claude Opus 5.5
-  and Claude Sonnet 5.5
+- Preserved-thinking prefix binding handled on Claude Fable 5.2, Claude Fable 5.1,
+  Claude Opus 5.5, Claude Sonnet 5.5 and Claude Haiku 5.5
 - Claude Sonnet 5.5 "between tools" thinking (its lowest setting, since it rejects
   turning thinking off)
+- Optional fast mode on Claude Opus 5.5 and Claude Fable 5.2, with a fallback to
+  standard speed when fast mode is out of capacity
+- Claude Haiku 5.5's two rate cards (prompts over 100K tokens cost more) in
+  cost tracking
 """
 
 import json
@@ -32,7 +40,7 @@ import re
 import time
 import requests
 from typing import List, Union, Generator, Iterator, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from open_webui.utils.misc import pop_system_message
 import anthropic
 import asyncio
@@ -124,10 +132,16 @@ class EventEmitter:
 
 class Pipe:
     class Valves(BaseModel):
-        ANTHROPIC_API_KEY: str = Field(default="")
+        ANTHROPIC_API_KEY: str = Field(
+            default="", json_schema_extra={"input": {"type": "password"}}
+        )
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
-            description="Whether to require user's own API key (applies to admins too).",
+            description=(
+                "Require every user (admins too) to set their own ANTHROPIC_API_KEY "
+                "in this function's user valves. The admin key above is then never "
+                "used, and a user without a key gets a message asking for one."
+            ),
         )
         THINKING_BUDGET: int = Field(
             default=8192,
@@ -141,21 +155,23 @@ class Pipe:
             default=True,
             description=(
                 "Enable Claude's extended thinking capability for supported models. "
-                "On Opus 5 and Sonnet 5 thinking is on by default at the API level, "
-                "so turning this off sends an explicit disabled config. Sonnet 5.5 "
-                "rejects disabled, so turning this off sends its lowest setting, "
-                "'between tools', where it only thinks between tool calls. Opus 5.5, "
-                "Fable 5.1 and Fable 5 always think (the API rejects disabling it), "
-                "so this valve has no effect there; lower EFFORT instead."
+                "On Haiku 5.5, Opus 5 and Sonnet 5 thinking is on by default at the "
+                "API level, so turning this off sends an explicit disabled config. "
+                "Sonnet 5.5 rejects disabled, so turning this off sends its lowest "
+                "setting, 'between tools', where it only thinks between tool calls. "
+                "Fable 5.2, Opus 5.5, Fable 5.1 and Fable 5 always think (the API "
+                "rejects disabling it), so this valve has no effect there; lower "
+                "EFFORT instead."
             ),
         )
         EFFORT: str = Field(
             default="",
             description=(
-                "Effort level for adaptive-thinking models (Opus 5.5, Fable 5.1, "
-                "Opus 5, Fable 5, Sonnet 5.5, Sonnet 5, Opus 4.8, Opus 4.6, "
-                "Sonnet 4.6). One of: low, medium, high, xhigh, max. Empty = API "
-                "default (medium on Opus 5.5, high elsewhere). "
+                "Effort level for adaptive-thinking models (Fable 5.2, Opus 5.5, "
+                "Sonnet 5.5, Haiku 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5, "
+                "Opus 4.8, Opus 4.6, Sonnet 4.6). One of: low, medium, high, xhigh, "
+                "max. Empty = API default (medium on Opus 5.5 and Haiku 5.5, high "
+                "elsewhere). "
                 "'xhigh' is not supported on Opus 4.6 / Sonnet 4.6. It is only "
                 "sent when thinking is on, so it does not apply to Sonnet 5.5's "
                 "'between tools' setting."
@@ -169,11 +185,22 @@ class Pipe:
                 "the reasoning text for lower streaming latency (the Thoughts section "
                 "still appears, with a short note in place of the reasoning). "
                 "Defaults to 'summarized' so it's clear the model thought. "
-                "Note: Opus 5.5, Fable 5.1, Opus 5, Fable 5, Sonnet 5.5, Sonnet 5 and "
-                "Opus 4.8 default to 'omitted' at the API level; this valve overrides "
-                "that. On Sonnet 5.5, 'omitted' also hides the short progress notes "
-                "it writes between tool calls. You are billed for thinking "
+                "Note: Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1, Opus 5, "
+                "Fable 5, Sonnet 5 and Opus 4.8 default to 'omitted' at the API "
+                "level; this valve overrides that. On Fable 5.2, Opus 5.5 and "
+                "Sonnet 5.5, 'omitted' also hides the short progress notes they "
+                "write between tool calls. You are billed for thinking "
                 "tokens either way."
+            ),
+        )
+        FAST_MODE: bool = Field(
+            default=False,
+            description=(
+                "Run Claude Opus 5.5 and Claude Fable 5.2 in fast mode: up to 2.5x "
+                "faster output at twice the token price (Opus 5.5 $8/$40, Fable 5.2 "
+                "$16/$80 per MTok). Other models ignore it. Fast mode has its own "
+                "rate limit; when it is out of capacity the request is retried at "
+                "standard speed. Changing speed starts a fresh prompt cache."
             ),
         )
         ENABLE_PROMPT_CACHING: bool = Field(
@@ -195,14 +222,51 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
-        ANTHROPIC_API_KEY: str = Field(default="")
-        THINKING_BUDGET: int = Field(default=8192)
-        MAX_TOKENS: int = Field(default=10240)
-        ENABLE_THINKING: bool = Field(default=True)
-        EFFORT: str = Field(default="")
-        THINKING_DISPLAY: str = Field(default="")
-        ENABLE_PROMPT_CACHING: bool = Field(default=True)
-        CACHE_TTL: str = Field(default="")
+        """Per-user overrides of the admin valves of the same name.
+
+        A valve the user leaves at "Default" in Open WebUI uses the admin's
+        setting. The defaults below only pre-fill the field when the user
+        switches it to "Custom"; they never override the admin.
+        """
+
+        ANTHROPIC_API_KEY: str = Field(
+            default="",
+            description="Your own Anthropic API key, used instead of the admin's.",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        THINKING_BUDGET: int = Field(
+            default=8192,
+            description="Thinking token budget on budget-based models (Opus 4.5 and older).",
+        )
+        MAX_TOKENS: int = Field(
+            default=10240,
+            description="Maximum tokens to generate, thinking included.",
+        )
+        ENABLE_THINKING: bool = Field(
+            default=True, description="Enable extended thinking (see the admin valve)."
+        )
+        EFFORT: str = Field(
+            default="", description="low, medium, high, xhigh or max (see the admin valve)."
+        )
+        THINKING_DISPLAY: str = Field(
+            default="", description="summarized or omitted (see the admin valve)."
+        )
+        ENABLE_PROMPT_CACHING: bool = Field(
+            default=True, description="Enable automatic prompt caching."
+        )
+        CACHE_TTL: str = Field(default="", description="Prompt cache lifetime: 5m or 1h.")
+
+        @model_validator(mode="before")
+        @classmethod
+        def _drop_unset(cls, data):
+            # Open WebUI saves a valve left at "Default" as null, and a field
+            # switched to "Custom" but never filled in as "". Validating either
+            # against an int or bool field fails, and Open WebUI then discards
+            # every one of the user's valves. Leaving them out keeps them
+            # unset, so they fall back to the admin's setting (_valve).
+            if isinstance(data, dict):
+                return {k: v for k, v in data.items() if v is not None and v != ""}
+            return data
 
     def __init__(self):
         self.type = "manifold"
@@ -222,68 +286,66 @@ class Pipe:
             )
 
         self.MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB per image
-        self.client = None
+        # Open WebUI shares one Pipe instance between every chat and user, so
+        # the API client (which holds the API key) and the event emitter are
+        # created per request and passed along, never stored on self.
         self.is_thinking = False
         self.is_code_execution = False
         self.code_execution_block_index = None
         # Whether code execution blocks are rendered into the chat (only when
         # the user asked for code execution — see _code_execution_declared).
         self.show_code_execution = True
-        self.event_emitter = None
 
         # Centralized model capability configuration
         self.MODEL_CAPABILITIES = {
             # Web Search: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+            # Every active model. Retired models (Opus 4.1 / 4, Sonnet 4 and
+            # the Claude 3.x models) are left out: requests to them fail.
             "web_search": {
+                "claude-fable-5-2",
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-5-20251101",
-                "claude-opus-4-1-20250805",
-                "claude-opus-4-20250514",
                 "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4-20250514",
                 "claude-haiku-4-5-20251001",
-                "claude-3-7-sonnet-20250219",
-                "claude-3-7-sonnet-latest",
-                "claude-3-5-sonnet-latest",
-                "claude-3-5-haiku-latest",
             },
             # Web Fetch: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
+            # Same models as web search.
             "web_fetch": {
+                "claude-fable-5-2",
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4-20250514",
-                "claude-3-7-sonnet-20250219",
                 "claude-haiku-4-5-20251001",
-                "claude-3-5-haiku-latest",
                 "claude-opus-4-5-20251101",
-                "claude-opus-4-1-20250805",
-                "claude-opus-4-20250514",
             },
             # Code Execution: According to https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
             "code_execution": {
+                "claude-fable-5-2",
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -305,11 +367,13 @@ class Pipe:
             # search-heavy turns. Available on Claude 4.6 and later models.
             # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
             "dynamic_web_tools": {
+                "claude-fable-5-2",
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -318,11 +382,13 @@ class Pipe:
             },
             # Extended Thinking: According to https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
             "thinking": {
+                "claude-fable-5-2",
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
                 "claude-opus-4-7",
@@ -343,11 +409,13 @@ class Pipe:
         # thinking (`{"type": "enabled", "budget_tokens": N}`) is rejected with
         # a 400 on all of these, so they must never take the budget path.
         self.ADAPTIVE_THINKING_MODELS = {
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "claude-sonnet-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
@@ -362,17 +430,23 @@ class Pipe:
         # Models that think when the `thinking` parameter is omitted, so
         # honoring ENABLE_THINKING=False requires sending an explicit
         # `{"type": "disabled"}` config rather than leaving it out.
+        # (Sonnet 5.5 also thinks by default; it has its own lowest setting,
+        # see THINKING_BETWEEN_TOOLS_MODELS.)
         self.THINKING_ON_BY_DEFAULT_MODELS = {
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5",
+            "claude-haiku-5-5",
+            "claude-sonnet-5",
         }
 
         # Models that reject `{"type": "disabled"}` outright — thinking is
         # always on and the parameter has to be omitted (or sent as
         # `{"type": "adaptive"}`).
         self.THINKING_ALWAYS_ON_MODELS = {
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-fable-5",
@@ -389,12 +463,16 @@ class Pipe:
         # message, the system prompt, the tool list) invalidates every later
         # block, and replaying one is rejected with a 400 ("The block is bound
         # to a different conversation") on accounts created on or after
-        # 2026-08-31. Open WebUI lets users edit and regenerate earlier turns,
-        # so the pipe opts into dropping invalidated blocks instead.
+        # 2026-08-31, and on every account for Fable 5.2. Open WebUI lets
+        # users edit and regenerate earlier turns, so the pipe opts into
+        # dropping invalidated blocks instead. That opt-in (block_binding)
+        # only works with adaptive thinking.
         self.PREFIX_BINDING_MODELS = {
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-opus-5-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5-5",
         }
 
         # Open WebUI builtin tools that duplicate an Anthropic server tool.
@@ -417,17 +495,20 @@ class Pipe:
 
         # Pricing per million tokens (Input / Output)
         # NOTE: _get_pricing matches by substring, so longer model IDs must
-        # come first — "claude-fable-5" is a prefix of "claude-fable-5-1",
-        # "claude-opus-5" is a prefix of "claude-opus-5-5" and
-        # "claude-sonnet-5" is a prefix of "claude-sonnet-5-5".
+        # come first — "claude-fable-5" is a prefix of "claude-fable-5-2" and
+        # "claude-fable-5-1", "claude-opus-5" is a prefix of "claude-opus-5-5"
+        # and "claude-sonnet-5" is a prefix of "claude-sonnet-5-5".
         self.PRICING = {
             # Claude 5 family
+            "claude-fable-5-2": {"input": 8.00, "output": 40.00},
             "claude-fable-5-1": {"input": 10.00, "output": 50.00},
             "claude-opus-5-5": {"input": 4.00, "output": 20.00},
             "claude-opus-5": {"input": 5.00, "output": 25.00},
             "claude-fable-5": {"input": 10.00, "output": 50.00},
             "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
             "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+            # Prompts of up to 100K tokens; see LONG_PROMPT_PRICING
+            "claude-haiku-5-5": {"input": 0.10, "output": 0.50},
             # Claude 4.8 / 4.7 family
             "claude-opus-4-8": {"input": 5.00, "output": 25.00},
             "claude-opus-4-7": {"input": 5.00, "output": 25.00},
@@ -450,26 +531,43 @@ class Pipe:
             "claude-3-haiku": {"input": 0.25, "output": 1.25},
         }
 
+        # Claude Haiku 5.5 has two rate cards: a request whose prompt (input
+        # plus cache reads and cache writes) is over 100,000 tokens pays these
+        # prices for the whole request, output included. Cache multipliers
+        # apply on top as usual.
+        self.LONG_PROMPT_PRICING = {
+            "claude-haiku-5-5": {"threshold": 100_000, "input": 0.50, "output": 2.50},
+        }
+
+        # Fast mode (`speed: "fast"`) prices. Only models listed here get
+        # fast mode from the FAST_MODE valve: Opus 5.5 and Fable 5.2 have it
+        # without a beta header or an access request. (Opus 5 and Opus 4.8 are
+        # research previews behind a beta and a waitlist.) Cache multipliers
+        # apply on top of these prices.
+        self.FAST_MODE_PRICING = {
+            "claude-fable-5-2": {"input": 16.00, "output": 80.00},
+            "claude-opus-5-5": {"input": 8.00, "output": 40.00},
+        }
+
         # Cache reads cost 0.10x the base input price on every model except
-        # Claude Fable 5.1 (0.025x: $0.25 per MTok against a $10 input price)
-        # and Claude Opus 5.5 (0.05x: $0.20 per MTok against a $4 input price).
-        # Sonnet 5.5 is the standard 0.10x ($0.20 against a $2 input price).
+        # Claude Fable 5.2 and 5.1 (0.025x: $0.20 and $0.25 per MTok against
+        # $8 and $10 input prices) and Claude Opus 5.5 and Sonnet 5.5 (0.05x:
+        # $0.20 and $0.10 per MTok against $4 and $2 input prices).
         self.CACHE_READ_MULTIPLIER = 0.10
         self.REDUCED_CACHE_READ_MODELS = {
+            "claude-fable-5-2": 0.025,
             "claude-fable-5-1": 0.025,
             "claude-opus-5-5": 0.05,
+            "claude-sonnet-5-5": 0.05,
         }
 
         # Cost per web search request ($10 per 1,000 searches)
         self.WEB_SEARCH_COST = 0.01
 
-        # Cache write premium over base input price (1.25x for 5m TTL,
-        # 2x for 1h TTL); updated per-request from the CACHE_TTL valve.
-        self.cache_write_multiplier = 1.25
-
     def get_anthropic_models(self):
         return [
             {"id": "claude-opus-5-5", "name": "claude-opus-5-5"},
+            {"id": "claude-fable-5-2", "name": "claude-fable-5-2"},
             #{"id": "claude-fable-5-1", "name": "claude-fable-5-1"},
             #{"id": "claude-opus-5", "name": "claude-opus-5"},
             # {"id": "claude-fable-5", "name": "claude-fable-5"},
@@ -478,6 +576,7 @@ class Pipe:
             # {"id": "claude-opus-4-8", "name": "claude-opus-4-8"},
             # {"id": "claude-opus-4-6", "name": "claude-opus-4-6"},
             # {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6"},
+            {"id": "claude-haiku-5-5", "name": "claude-haiku-5-5"},
             #{"id": "claude-haiku-4-5-20251001", "name": "claude-haiku-4-5"},
         ]
 
@@ -496,9 +595,22 @@ class Pipe:
                 capabilities.append(capability)
         return capabilities
 
-    def _get_pricing(self, model_name: str) -> dict[str, float]:
-        """Get pricing for a specific model."""
-        # Try exact match first
+    def _get_pricing(
+        self, model_name: str, prompt_tokens: int = 0, speed: Optional[str] = None
+    ) -> dict[str, float]:
+        """Per-MTok input and output prices for one request.
+
+        `speed` is the speed the request ran at (`usage.speed`), and
+        `prompt_tokens` its full prompt length (input plus cache reads and
+        writes), which picks Haiku 5.5's long-prompt rate card.
+        """
+        if speed == "fast":
+            for key, pricing in self.FAST_MODE_PRICING.items():
+                if key in model_name:
+                    return pricing
+        for key, pricing in self.LONG_PROMPT_PRICING.items():
+            if key in model_name and prompt_tokens > pricing["threshold"]:
+                return pricing
         for key, pricing in self.PRICING.items():
             if key in model_name:
                 return pricing
@@ -522,14 +634,24 @@ class Pipe:
         web_search_count: int = 0,
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
+        speed: Optional[str] = None,
+        cache_ttl: Optional[str] = None,
     ) -> float:
-        """Calculate total cost for the usage."""
-        pricing = self._get_pricing(model_name)
+        """Calculate total cost for the usage.
+
+        `cache_ttl` is the request's cache lifetime: cache writes cost 2x the
+        base input price for "1h" and 1.25x for the default 5 minutes.
+        """
+        pricing = self._get_pricing(
+            model_name,
+            prompt_tokens=input_tokens + cache_creation_tokens + cache_read_tokens,
+            speed=speed,
+        )
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         cache_write_cost = (
             (cache_creation_tokens / 1_000_000)
             * pricing["input"]
-            * self.cache_write_multiplier
+            * (2.0 if cache_ttl == "1h" else 1.25)
         )
         cache_read_cost = (
             (cache_read_tokens / 1_000_000)
@@ -561,10 +683,11 @@ class Pipe:
     def _refusal_notice(self, stop_details=None) -> str:
         """Build a user-facing notice for a `stop_reason: "refusal"` response.
 
-        Sonnet 5.5 / Opus 5.5 / Opus 5 (like Fable 5.1 / Fable 5) run safety
-        classifiers that can decline a request. That comes back as a
-        successful HTTP 200 with an empty or partial content list, so without
-        this the user would just see a blank reply with no explanation.
+        Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5 (like Fable 5.1 / Opus 5
+        / Fable 5) run safety classifiers that can decline a request. That
+        comes back as a successful HTTP 200 with an empty or partial content
+        list, so without this the user would just see a blank reply with no
+        explanation.
         """
         category = getattr(stop_details, "category", None)
         explanation = getattr(stop_details, "explanation", None)
@@ -848,63 +971,132 @@ class Pipe:
                 "source": {"type": "url", "url": url},
             }
 
-    def init_client(self, user_valves=None, event_emitter=None):
-        """Initialize the Anthropic client with the appropriate API key.
+    def _user_valves(self, user) -> Optional["Pipe.UserValves"]:
+        """The requesting user's valves.
+
+        Open WebUI passes `__user__` as a dict whose "valves" entry is already
+        a UserValves instance built from that user's saved valves. It is
+        rebuilt here from the fields the user actually set, so a dict (or an
+        instance of the class from before a code reload) works too.
+        """
+        valves = user.get("valves") if isinstance(user, dict) else None
+        if isinstance(valves, BaseModel):
+            valves = valves.model_dump(exclude_unset=True)
+        if not isinstance(valves, dict):
+            return None
+        try:
+            return self.UserValves(**valves)
+        except Exception as e:
+            print(f"Error parsing user valves: {e}")
+            return None
+
+    def _valve(self, user_valves, name: str):
+        """A setting for this request: the user's value if they set one,
+        otherwise the admin's.
+
+        A user valve counts as set only when the user switched it to "Custom"
+        and gave it a value (see UserValves._drop_unset), so the UserValves
+        defaults never override the admin.
+        """
+        if user_valves is not None and name in user_valves.model_fields_set:
+            return getattr(user_valves, name)
+        return getattr(self.valves, name)
+
+    def _api_key(self, user_valves) -> Optional[str]:
+        """The API key for this request, or None if a required user key is missing.
+
+        A user's own key takes precedence. With REQUIRE_USER_API_KEY on, the
+        admin's key is never used.
+        """
+        user_key = user_valves.ANTHROPIC_API_KEY if user_valves is not None else ""
+        if user_key:
+            return user_key
+        if self.valves.REQUIRE_USER_API_KEY:
+            return None
+        return self.valves.ANTHROPIC_API_KEY
+
+    def _make_client(self, api_key: str):
+        """An Anthropic client for one request.
+
+        Open WebUI shares one Pipe instance between users and runs their
+        requests concurrently, so the client (and the API key in it) is never
+        stored on the instance, where another user's request could replace it
+        before this one is sent.
 
         Beta headers are not set here. Which betas a request needs depends on
         the model and the tools enabled for that request, so they are sent per
         request via `extra_headers` (see `_beta_headers`) rather than baked
         into the client's default headers.
         """
-        if event_emitter:
-            self.event_emitter = EventEmitter(event_emitter)
+        return anthropic.Anthropic(api_key=api_key)
 
-        if not self.client:
-            # Use user's API key if provided and allowed
-            api_key = None
-            if (
-                user_valves
-                and hasattr(user_valves, "ANTHROPIC_API_KEY")
-                and user_valves.ANTHROPIC_API_KEY
-            ):
-                api_key = user_valves.ANTHROPIC_API_KEY
-            else:
-                api_key = self.valves.ANTHROPIC_API_KEY
+    def _cache_ttl(self, params) -> Optional[str]:
+        """The cache lifetime a request asked for ("1h"), for pricing writes."""
+        return ((params.get("extra_body") or {}).get("cache_control") or {}).get("ttl")
 
-            if not api_key and self.valves.REQUIRE_USER_API_KEY:
-                raise ValueError("API key is required but not provided")
-
-            self.client = anthropic.Anthropic(api_key=api_key)
-
-    def _beta_headers(
-        self,
-        model_name,
-        web_fetch_enabled=False,
-        dynamic_web_tools=False,
-        block_binding=False,
-    ) -> List[str]:
+    def _beta_headers(self, params) -> List[str]:
         """Beta opt-ins this request needs, as `anthropic-beta` values.
 
-        Code execution no longer needs one: every current tool version
-        (`code_execution_20250825` through `code_execution_20260521`) is GA.
+        The server tools no longer need one: every current version of web
+        search, web fetch (including the basic `web_fetch_20250910`, which
+        used to need `web-fetch-2025-09-10`) and code execution is GA.
         """
         betas = []
 
-        if block_binding:
+        if "block_binding" in (params.get("thinking") or {}):
             # Lets the API drop thinking blocks invalidated by an edited
             # history instead of rejecting the whole request.
             betas.append("thinking-binding-controls-2026-08-01")
 
-        if (
-            web_fetch_enabled
-            and not dynamic_web_tools
-            and self.supports_capability(model_name, "web_fetch")
-        ):
-            # Only the basic web_fetch_20250910 version needs this beta
-            # header; the dynamic-filtering versions are GA.
-            betas.append("web-fetch-2025-09-10")
-
         return betas
+
+    def _drop_fast_mode(self, params, error) -> bool:
+        """Switch a fast mode request to standard speed after a capacity error.
+
+        Fast mode has its own rate limit and capacity. When either runs out
+        the API answers 429 (or 529), even though the same request would run
+        at standard speed. The SDK has already retried with the server's
+        `retry-after` delay by then. Returns True when `speed` was removed and
+        the request should be sent again.
+        """
+        extra_body = params.get("extra_body") or {}
+        if extra_body.get("speed") != "fast":
+            return False
+        status = getattr(error, "status_code", None)
+        if status not in (429, 529):
+            return False
+        del extra_body["speed"]
+        print(
+            f"Fast mode unavailable for {params['model']} ({status}); "
+            "retrying at standard speed."
+        )
+        return True
+
+    def _requested_speed(self, params) -> Optional[str]:
+        """The speed a request asked for, for when the response omits it."""
+        return (params.get("extra_body") or {}).get("speed")
+
+    def _open_stream(self, client, params):
+        """Open a message stream, falling back to standard speed if needed.
+
+        The request is sent when the stream opens, so a fast mode capacity
+        error arrives here, before anything has been yielded to the chat.
+        """
+        try:
+            return client.messages.stream(**params).__enter__()
+        except anthropic.APIStatusError as e:
+            if self._drop_fast_mode(params, e):
+                return client.messages.stream(**params).__enter__()
+            raise
+
+    def _create_message(self, client, params):
+        """Non-streaming request, falling back to standard speed if needed."""
+        try:
+            return client.messages.create(**params)
+        except anthropic.APIStatusError as e:
+            if self._drop_fast_mode(params, e):
+                return client.messages.create(**params)
+            raise
 
     async def pipe(
         self,
@@ -914,20 +1106,21 @@ class Pipe:
         __event_emitter__=None,
         **kwargs,
     ) -> Union[str, Generator, Iterator, AsyncIterator]:
-        # Get user valves if user info is provided
-        user_valves = None
-        if __user__ and hasattr(__user__, "valves") and __user__.valves:
-            # Try to parse user valves
-            try:
-                user_valves = self.UserValves(**__user__.valves.get("anthropic", {}))
-            except Exception as e:
-                print(f"Error parsing user valves: {e}")
+        # The requesting user's overrides of the admin valves (see _valve)
+        user_valves = self._user_valves(__user__)
 
         # Prepare common parameters
         model_name = body["model"][body["model"].find(".") + 1 :]
 
-        # Reset client to ensure correct headers for the model
-        self.client = None
+        api_key = self._api_key(user_valves)
+        if api_key is None:
+            return (
+                "This model needs your own Anthropic API key. Add it as "
+                "ANTHROPIC_API_KEY in this function's valves (the chat's "
+                "Controls panel, under Valves), then send your message again."
+            )
+        client = self._make_client(api_key)
+        event_emitter = EventEmitter(__event_emitter__) if __event_emitter__ else None
 
         # UI toggles. Open WebUI pops `features` off the request body before
         # calling pipes and passes them in __metadata__; the body is only a
@@ -947,44 +1140,54 @@ class Pipe:
         # Check if code execution is enabled in the UI
         code_execution_enabled = bool(features.get("code_interpreter"))
 
-        # Check if web search is enabled in the UI
+        # Check if web search is enabled in the UI. The toggle switches on
+        # Claude's own web tools in place of Open WebUI's: with native function
+        # calling, Open WebUI answers it by offering its builtin search_web and
+        # fetch_url, and both are dropped below once the Anthropic versions are
+        # declared.
         web_search_enabled = bool(features.get("web_search"))
 
         # Check if web fetch is enabled via the url_context toggle filter, which
-        # shows up in filter_ids and sets "url_context" in features
-        web_fetch_enabled = "gemini_url_context_toggle" in (
-            metadata.get("filter_ids") or []
-        ) or bool(features.get("url_context"))
-
-        # Check if thinking is enabled in valves
-        thinking_enabled = (
-            user_valves.ENABLE_THINKING
-            if user_valves and hasattr(user_valves, "ENABLE_THINKING")
-            else self.valves.ENABLE_THINKING
+        # shows up in filter_ids and sets "url_context" in features. The web
+        # search toggle turns it on too, so replacing Open WebUI's fetch_url
+        # doesn't take away reading the pages a user links to.
+        web_fetch_enabled = (
+            web_search_enabled
+            or "gemini_url_context_toggle" in (metadata.get("filter_ids") or [])
+            or bool(features.get("url_context"))
         )
 
-        # "Thinking off" on these models is the API's lowest thinking setting,
-        # and it can't carry block_binding, so no thinking blocks are replayed.
+        # Check if thinking is enabled in valves
+        thinking_enabled = self._valve(user_valves, "ENABLE_THINKING")
+
+        # "Thinking off" on these models is the API's lowest thinking setting
         between_tools = (
             not thinking_enabled and model_name in self.THINKING_BETWEEN_TOOLS_MODELS
         )
 
-        # Pick the web tool versions for this request. The dynamic-filtering
-        # versions run their filtering code inside a code execution sandbox that
-        # the API provisions itself, so the code execution tool must not also be
-        # declared in the same request — a second execution environment confuses
-        # the model, and the pipe declares an older code execution version than
-        # dynamic filtering calls into. When the user has the code interpreter
-        # toggled on, their code execution wins and the basic web tools are used.
-        code_execution_requested = code_execution_enabled and self.supports_capability(
-            model_name, "code_execution"
-        )
-        use_dynamic_web_tools = (
-            self.supports_capability(model_name, "dynamic_web_tools")
-            and not code_execution_requested
+        # On models that bind thinking blocks to the conversation prefix,
+        # turning thinking off (Sonnet 5.5's between_tools, Haiku 5.5's
+        # disabled) leaves nowhere to put block_binding, so an edited or
+        # regenerated chat would fail on its replayed thinking blocks. Those
+        # requests replay none. Always-on models keep adaptive thinking, so
+        # they keep block_binding and their thinking blocks.
+        replay_thinking = not (
+            not thinking_enabled
+            and model_name in self.PREFIX_BINDING_MODELS
+            and model_name not in self.THINKING_ALWAYS_ON_MODELS
         )
 
-        self.init_client(user_valves, __event_emitter__)
+        # Pick the web tool versions for this request. The dynamic-filtering
+        # versions run their filtering code in a sandbox the API provisions
+        # itself, or in the code execution tool's container when the code
+        # interpreter is on too: the API accepts code_execution_20260120 or
+        # later alongside them, and code execution is free in those requests.
+        # Claude reads its code's filtered output rather than the raw results,
+        # so these answers name their sources in the text instead of returning
+        # citation blocks (only the basic versions fill Open WebUI's Sources).
+        use_dynamic_web_tools = self.supports_capability(
+            model_name, "dynamic_web_tools"
+        )
 
         # Log model capabilities for debugging
         capabilities = self.get_model_capabilities(model_name)
@@ -1011,7 +1214,7 @@ class Pipe:
         system_message, messages = pop_system_message(body["messages"])
 
         processed_messages = self._convert_messages(
-            messages, replay_thinking=not between_tools
+            messages, replay_thinking=replay_thinking
         )
 
         # Add tools for supported models
@@ -1036,10 +1239,11 @@ class Pipe:
             self.supports_capability(model_name, "code_execution")
             and code_execution_enabled
         ):
-            # code_execution_20260521: same runtime as 20260120, and the
-            # version the current dynamic-filtering web tools call into.
-            # Every supported model accepts it and none of the current
-            # versions needs a beta header.
+            # code_execution_20260521: same runtime as 20260120, the oldest
+            # version the API accepts alongside the dynamic-filtering web
+            # tools, which then run in this tool's container. Every supported
+            # model accepts it and none of the current versions needs a beta
+            # header.
             tools.append({"type": "code_execution_20260521", "name": "code_execution"})
 
         # Add web fetch tool if supported by model and enabled
@@ -1074,13 +1278,11 @@ class Pipe:
         tools = tools if tools else None
 
         # Create the parameters dict for the API call
-        # Get max_tokens from user valves, system valves, or body, in that order of preference
+        # max_tokens from the request body (a model's advanced params), else
+        # the user's valve, else the admin's
         max_tokens = body.get("max_tokens", None)
         if max_tokens is None:
-            if user_valves and hasattr(user_valves, "MAX_TOKENS"):
-                max_tokens = user_valves.MAX_TOKENS
-            else:
-                max_tokens = self.valves.MAX_TOKENS
+            max_tokens = self._valve(user_valves, "MAX_TOKENS")
 
         params = {
             "model": model_name,
@@ -1100,11 +1302,7 @@ class Pipe:
                 # visible in the Thoughts section. Opus 5 / Fable 5 / Sonnet 5 / Opus 4.8
                 # default to "omitted" (empty thinking text) at the API level, so we
                 # set this explicitly.
-                display = (
-                    user_valves.THINKING_DISPLAY
-                    if user_valves and getattr(user_valves, "THINKING_DISPLAY", "")
-                    else self.valves.THINKING_DISPLAY
-                )
+                display = self._valve(user_valves, "THINKING_DISPLAY")
                 display = (display or "summarized").strip().lower()
                 if display not in ("summarized", "omitted"):
                     print(f"Invalid THINKING_DISPLAY '{display}'; using 'summarized'.")
@@ -1119,11 +1317,7 @@ class Pipe:
 
                 # Optional effort guidance (output_config.effort). Sent via
                 # extra_body so it works regardless of installed SDK version.
-                effort = (
-                    user_valves.EFFORT
-                    if user_valves and getattr(user_valves, "EFFORT", "")
-                    else self.valves.EFFORT
-                )
+                effort = self._valve(user_valves, "EFFORT")
                 effort = (effort or "").strip().lower()
                 if effort:
                     valid_efforts = {"low", "medium", "high", "xhigh", "max"}
@@ -1149,11 +1343,7 @@ class Pipe:
                     body["stream"] = True
             else:
                 # Get thinking budget from user valves or default to system valve
-                thinking_budget = (
-                    user_valves.THINKING_BUDGET
-                    if user_valves and hasattr(user_valves, "THINKING_BUDGET")
-                    else self.valves.THINKING_BUDGET
-                )
+                thinking_budget = self._valve(user_valves, "THINKING_BUDGET")
 
                 # Validate thinking budget according to documentation requirements
                 if thinking_budget > 0:
@@ -1197,15 +1387,17 @@ class Pipe:
             model_name in self.THINKING_ON_BY_DEFAULT_MODELS
             and model_name not in self.THINKING_ALWAYS_ON_MODELS
         ):
-            # Opus 5 thinks when `thinking` is omitted, so ENABLE_THINKING=False
-            # has to be sent explicitly. The API only accepts a disabled config at
-            # effort "high" or below, and effort is only sent alongside adaptive
-            # thinking above, so the API default (high) applies here.
+            # Opus 5, Haiku 5.5 and Sonnet 5 think when `thinking` is omitted, so
+            # ENABLE_THINKING=False has to be sent explicitly. Opus 5 and Haiku
+            # 5.5 only accept a disabled config at effort "high" or below, and
+            # effort is only sent alongside adaptive thinking above, so the API
+            # default (high on Opus 5, medium on Haiku 5.5) applies here.
             params["thinking"] = {"type": "disabled"}
             print(f"Disabling thinking for {model_name} (thinking is on by default)")
         elif model_name in self.THINKING_ALWAYS_ON_MODELS:
-            # Opus 5.5 / Fable 5.1 / Fable 5 reject `{"type": "disabled"}` at any
-            # effort — thinking is always on and the parameter must be omitted.
+            # Fable 5.2 / Opus 5.5 / Fable 5.1 / Fable 5 reject `{"type":
+            # "disabled"}` at any effort — thinking is always on and the
+            # parameter must be omitted.
             print(
                 f"Thinking cannot be disabled on {model_name}; leaving it on (API default)."
             )
@@ -1217,15 +1409,14 @@ class Pipe:
         # invalidated blocks and answer anyway. `{"type": "adaptive"}` is the
         # always-on default on these models, so adding it when thinking is off
         # in the valves changes nothing except giving block_binding a home.
-        # block_binding only works with adaptive thinking.
-        block_binding = False
+        # block_binding only works with adaptive thinking (it's a 400 alongside
+        # Sonnet 5.5's between_tools or Haiku 5.5's disabled).
         if model_name in self.PREFIX_BINDING_MODELS:
             thinking_params = params.setdefault("thinking", {"type": "adaptive"})
             if thinking_params["type"] == "adaptive":
                 thinking_params["block_binding"] = {
                     "prefix_mismatch_behavior": "drop_block"
                 }
-                block_binding = True
 
         # Automatic prompt caching: a top-level cache_control makes the API
         # place a cache breakpoint on the last cacheable block and move it
@@ -1234,26 +1425,24 @@ class Pipe:
         # every request. Prompts below the model's minimum cacheable length
         # are silently processed without caching, so this is always safe to
         # send. Passed via extra_body to work on any installed SDK version.
-        caching_enabled = (
-            user_valves.ENABLE_PROMPT_CACHING
-            if user_valves and hasattr(user_valves, "ENABLE_PROMPT_CACHING")
-            else self.valves.ENABLE_PROMPT_CACHING
-        )
+        caching_enabled = self._valve(user_valves, "ENABLE_PROMPT_CACHING")
         if caching_enabled:
-            cache_ttl = (
-                user_valves.CACHE_TTL
-                if user_valves and getattr(user_valves, "CACHE_TTL", "")
-                else self.valves.CACHE_TTL
-            )
+            cache_ttl = self._valve(user_valves, "CACHE_TTL")
             cache_ttl = (cache_ttl or "5m").strip().lower()
             if cache_ttl not in ("5m", "1h"):
                 print(f"Invalid CACHE_TTL '{cache_ttl}'; using '5m'.")
                 cache_ttl = "5m"
-            self.cache_write_multiplier = 2.0 if cache_ttl == "1h" else 1.25
             cache_control = {"type": "ephemeral"}
             if cache_ttl == "1h":
                 cache_control["ttl"] = "1h"
             params.setdefault("extra_body", {})["cache_control"] = cache_control
+
+        # Fast mode: the same model with faster output, at a premium price.
+        # Requests at different speeds don't share a prompt cache. Sent via
+        # extra_body like the settings above.
+        if self.valves.FAST_MODE and model_name in self.FAST_MODE_PRICING:
+            params.setdefault("extra_body", {})["speed"] = "fast"
+            print(f"Using fast mode for {model_name}")
 
         # Add optional parameters
         if system_message:
@@ -1275,22 +1464,21 @@ class Pipe:
         if tools:
             params["tools"] = tools
 
-        beta_headers = self._beta_headers(
-            model_name,
-            web_fetch_enabled=web_fetch_enabled,
-            dynamic_web_tools=use_dynamic_web_tools,
-            block_binding=block_binding,
-        )
+        beta_headers = self._beta_headers(params)
         if beta_headers:
             params["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
 
         try:
             if body.get("stream", False):
-                return self.stream_response_sdk(params, tool_names)
+                return self.stream_response_sdk(
+                    client, params, tool_names, event_emitter
+                )
             else:
                 # Awaited here: Open WebUI awaits pipe() itself but not a
                 # coroutine it returns, which would leave the reply empty
-                return await self.non_stream_response_sdk(params, tool_names)
+                return await self.non_stream_response_sdk(
+                    client, params, tool_names, event_emitter
+                )
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
             print(error_msg)
@@ -1308,10 +1496,14 @@ class Pipe:
             print(error_msg)
             return error_msg
 
-    async def stream_response_sdk(self, params, tool_names=None):
+    async def stream_response_sdk(
+        self, client, params, tool_names=None, event_emitter=None
+    ):
         """Stream a response to Open WebUI.
 
-        `tool_names` maps API tool names back to Open WebUI tool names.
+        `client` and `event_emitter` belong to this request (see
+        _make_client), and `tool_names` maps API tool names back to Open WebUI
+        tool names.
         """
         tool_names = tool_names or {}
         try:
@@ -1325,7 +1517,7 @@ class Pipe:
                 thinking_config.get("type") not in ("enabled", "between_tools")
                 and thinking_config.get("display", "omitted") == "omitted"
             )
-            with self.client.messages.stream(**params) as stream:
+            with self._open_stream(client, params) as stream:
                 # For extended thinking: handle thinking blocks in the stream
                 self.is_thinking = False
                 self.thinking_signature = None
@@ -1354,6 +1546,8 @@ class Pipe:
                 cache_creation_tokens = 0
                 cache_read_tokens = 0
                 web_search_count = 0
+                # "fast" or "standard", from usage; prices fast mode requests
+                speed = None
 
                 # Track when we're in tool usage to add proper spacing after tools
                 in_tool_usage = False
@@ -1380,10 +1574,22 @@ class Pipe:
                                 cache_read_tokens = (
                                     getattr(usage, "cache_read_input_tokens", 0) or 0
                                 )
+                                speed = getattr(usage, "speed", None) or speed
 
                         elif event.type == "message_delta":
                             if hasattr(event, "usage"):
                                 output_tokens = event.usage.output_tokens
+                                speed = getattr(event.usage, "speed", None) or speed
+                                # The billed search count (failed searches
+                                # aren't billed) replaces the running count
+                                # of search calls seen in the stream
+                                server_tool_use = getattr(
+                                    event.usage, "server_tool_use", None
+                                )
+                                if server_tool_use is not None:
+                                    web_search_count = (
+                                        server_tool_use.web_search_requests or 0
+                                    )
                             # A safety classifier can decline the request
                             # mid-stream (or before any output) — the stream
                             # ends normally, so surface it explicitly.
@@ -1676,7 +1882,7 @@ class Pipe:
                         # Handle content block stop for text to emit citations
                         elif event.type == "content_block_stop":
                             # If we have collected citations for this block, emit them
-                            if current_citations and self.event_emitter:
+                            if current_citations and event_emitter:
                                 # Process citations into Open WebUI Source format
                                 sources = []
                                 for citation in current_citations:
@@ -1743,9 +1949,9 @@ class Pipe:
                                             ),
                                         }
 
-                                    elif hasattr(
-                                        citation, "url"
-                                    ):  # Web search/fetch citation (inferred structure)
+                                    elif citation.type == "web_search_result_location":
+                                        # Web search (web fetch cites with
+                                        # char_location / page_location)
                                         source["source"]["type"] = "web_search_result"
                                         source["source"]["url"] = getattr(
                                             citation, "url", ""
@@ -1780,7 +1986,7 @@ class Pipe:
                                     sources.append(source["source"])
 
                                 if sources:
-                                    await self.event_emitter.emit_completion(
+                                    await event_emitter.emit_completion(
                                         sources=sources
                                     )
 
@@ -1815,7 +2021,8 @@ class Pipe:
             total_prompt_tokens = (
                 input_tokens + cache_creation_tokens + cache_read_tokens
             )
-            if self.event_emitter and total_prompt_tokens > 0:
+            if event_emitter and total_prompt_tokens > 0:
+                speed = speed or self._requested_speed(params)
                 total_cost = self._calculate_cost(
                     input_tokens,
                     output_tokens,
@@ -1823,6 +2030,8 @@ class Pipe:
                     web_search_count,
                     cache_creation_tokens,
                     cache_read_tokens,
+                    speed=speed,
+                    cache_ttl=self._cache_ttl(params),
                 )
                 completion_time = time.time() - stream_start_time
 
@@ -1836,8 +2045,10 @@ class Pipe:
                 if cache_creation_tokens or cache_read_tokens:
                     usage_data["cache_creation_input_tokens"] = cache_creation_tokens
                     usage_data["cache_read_input_tokens"] = cache_read_tokens
+                if speed == "fast":
+                    usage_data["speed"] = speed
 
-                await self.event_emitter.emit_usage(usage_data)
+                await event_emitter.emit_usage(usage_data)
 
         except anthropic.AuthenticationError as e:
             error_msg = f"Authentication error with Anthropic API: {e}. Please check your API key."
@@ -1856,7 +2067,9 @@ class Pipe:
             print(error_msg)
             yield error_msg
 
-    async def non_stream_response_sdk(self, params, tool_names=None):
+    async def non_stream_response_sdk(
+        self, client, params, tool_names=None, event_emitter=None
+    ):
         """Return a complete response as an OpenAI-format chat completion.
 
         Thinking goes in `reasoning_content` / `reasoning_details` and client
@@ -1866,7 +2079,7 @@ class Pipe:
         try:
             start_time = time.time()
             self.show_code_execution = self._code_execution_declared(params)
-            response = self.client.messages.create(**params)
+            response = self._create_message(client, params)
 
             # A safety classifier may decline the request: HTTP 200 with
             # stop_reason "refusal" and empty (or partial) content.
@@ -1994,9 +2207,9 @@ class Pipe:
                                         ),
                                     }
 
-                                elif hasattr(
-                                    citation, "url"
-                                ):  # Web search/fetch citation (inferred structure)
+                                elif citation.type == "web_search_result_location":
+                                    # Web search (web fetch cites with
+                                    # char_location / page_location)
                                     source["source"]["type"] = "web_search_result"
                                     source["source"]["url"] = getattr(
                                         citation, "url", ""
@@ -2103,11 +2316,11 @@ class Pipe:
                     elif content_block.type == "web_fetch_tool_result":
                         result_parts.append("Fetched.\n\n")
 
-                if all_citations and self.event_emitter:
-                    await self.event_emitter.emit_completion(sources=all_citations)
+                if all_citations and event_emitter:
+                    await event_emitter.emit_completion(sources=all_citations)
 
                 # Emit usage
-                if self.event_emitter and hasattr(response, "usage"):
+                if event_emitter and hasattr(response, "usage"):
                     input_tokens = response.usage.input_tokens
                     output_tokens = response.usage.output_tokens
                     cache_creation_tokens = (
@@ -2118,21 +2331,21 @@ class Pipe:
                     )
 
                     # Try to get web search count from usage if available, otherwise count properties could be used
-                    # but simpler to rely on parsing content blocks if we tracked them.
-                    # As a fallback, let's recount from content blocks for consistency or check usage
-                    web_search_count = 0
-                    if hasattr(response, "usage") and isinstance(response.usage, dict):
-                        # check dict
-                        pass
-
-                    # Manual count from content blocks is reliable for intent
-                    for block in response.content:
-                        if (
-                            block.type == "server_tool_use"
+                    # billed), or the search calls in the reply without it
+                    server_tool_use = getattr(response.usage, "server_tool_use", None)
+                    if server_tool_use is not None:
+                        web_search_count = server_tool_use.web_search_requests or 0
+                    else:
+                        web_search_count = sum(
+                            1
+                            for block in response.content
+                            if block.type == "server_tool_use"
                             and block.name == "web_search"
-                        ):
-                            web_search_count += 1
+                        )
 
+                    speed = getattr(
+                        response.usage, "speed", None
+                    ) or self._requested_speed(params)
                     total_cost = self._calculate_cost(
                         input_tokens,
                         output_tokens,
@@ -2140,6 +2353,8 @@ class Pipe:
                         web_search_count,
                         cache_creation_tokens,
                         cache_read_tokens,
+                        speed=speed,
+                        cache_ttl=self._cache_ttl(params),
                     )
                     completion_time = time.time() - start_time
 
@@ -2160,8 +2375,10 @@ class Pipe:
                             cache_creation_tokens
                         )
                         usage_data["cache_read_input_tokens"] = cache_read_tokens
+                    if speed == "fast":
+                        usage_data["speed"] = speed
 
-                    await self.event_emitter.emit_usage(usage_data)
+                    await event_emitter.emit_usage(usage_data)
 
                 if refusal_notice:
                     result_parts.append(refusal_notice)
